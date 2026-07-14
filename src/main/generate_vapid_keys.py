@@ -33,8 +33,8 @@ def generate_vapid_keys():
         
         public_key_b64 = base64.urlsafe_b64encode(public_key_raw).decode('utf-8').rstrip('=')
         
-        print(f"VAPID_PRIVATE_KEY=\"{private_key_b64}\"")
-        print(f"VAPID_PUBLIC_KEY=\"{public_key_b64}\"")
+        print(f"VAPID_PRIVATE_KEY={private_key_b64}")
+        print(f"VAPID_PUBLIC_KEY={public_key_b64}")
         
         return private_key_b64, public_key_b64
     except Exception as e:

@@ -70,11 +70,12 @@ RUN mkdir -p /app/files /app/logs && \
     chown -R filestorage:filestorage /app && \
     chmod 700 /app
 
-USER filestorage
+# Start as root so bind-mounted host dirs can be re-owned, then drop to filestorage.
+USER root
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD python3 /usr/local/bin/healthcheck.py
 
 EXPOSE ${PORT:-8302}
 
-CMD ["sh", "-c", "chown -R filestorage:filestorage /app/files /app/logs 2>/dev/null || true && exec python -m src.file_storage.main"]
+CMD ["sh", "-c", "chown -R filestorage:filestorage /app/files /app/logs && exec setpriv --reuid=filestorage --regid=filestorage --init-groups -- python -m src.file_storage.main"]

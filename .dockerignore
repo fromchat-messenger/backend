@@ -2,8 +2,12 @@
 node_modules
 npm-debug.log
 .env
+.env.prod
+.env.*
 .idea
 .vscode
+.cursor
+.deploy-cache
 
 # Python
 __pycache__/

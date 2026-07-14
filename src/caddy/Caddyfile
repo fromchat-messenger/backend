@@ -1,36 +1,53 @@
 {
-	servers {
+	# Per-port listener wrappers: global `servers {}` does not apply to the
+	# auto-created HTTP listener used for ACME HTTP-01 (see caddyserver/caddy#5602).
+	servers :8080 {
 		listener_wrappers {
-			proxy_protocol
+			proxy_protocol {
+				timeout 5s
+				# HAProxy (host) -> published 127.0.0.1:8080 arrives via docker bridge.
+				allow 127.0.0.0/8 ::1/128 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+			}
+		}
+		trusted_proxies static private_ranges 127.0.0.1/32 ::1/128
+	}
+	servers :8443 {
+		listener_wrappers {
+			proxy_protocol {
+				timeout 5s
+				allow 127.0.0.0/8 ::1/128 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+			}
 			tls
 		}
-
-		# Only trust PROXY protocol from local forwarder.
-		trusted_proxies static 127.0.0.1/32 ::1/128
+		trusted_proxies static private_ranges 127.0.0.1/32 ::1/128
 	}
-
 	http_port 8080
 	https_port 8443
 }
 
+:8080 {
+	# Keeps the HTTP server in config so :8080 listener wrappers apply (ACME HTTP-01).
+}
+
 fromchat.ru {
-	reverse_proxy frontend:8301 {
+	reverse_proxy web:80 {
 		header_up X-Real-IP {remote_host}
 	}
 
-	# Security headers
 	header {
 		X-XSS-Protection "1; mode=block" # Prevent XSS attacks
 		X-Content-Type-Options "nosniff" # Prevent MIME type sniffing
 		X-Frame-Options "DENY" # Prevent clickjacking
 		Referrer-Policy "strict-origin-when-cross-origin"
-		Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https: blob:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'none';"
 		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
 		Permissions-Policy "geolocation=(), microphone=(self), camera=(self)"
 	}
 
 	rate_limit {
 		zone global {
+			match {
+				not path /.well-known/acme-challenge/*
+			}
 			key {remote_ip}
 			window 1m
 			burst 20
@@ -40,7 +57,7 @@ fromchat.ru {
 
 	handle_errors {
 		@errors {
-			expression {err.status_code} >= 400
+			expression {err.status_code} >= 400 && !{path}.startsWith("/.well-known/acme-challenge/")
 		}
 
 		handle @errors {
@@ -53,8 +70,8 @@ fromchat.ru {
 	}
 }
 
-beta.fromchat.ru {
-    reverse_proxy 95.165.0.162:8301 {
+api.fromchat.ru {
+    reverse_proxy main:8300 {
         header_up X-Real-IP {remote_host}
     }
 
@@ -71,6 +88,9 @@ beta.fromchat.ru {
 
 	rate_limit {
 		zone global {
+			match {
+				not path /.well-known/acme-challenge/*
+			}
 			key {remote_ip}
 			window 1m
 			burst 20
@@ -80,12 +100,12 @@ beta.fromchat.ru {
 
 	handle_errors {
 		@errors {
-			expression {err.status_code} >= 400
+			expression {err.status_code} >= 400 && !{path}.startsWith("/.well-known/acme-challenge/")
 		}
 
 		handle @errors {
 			rewrite * /{err.status_code}
-			reverse_proxy https://http.cat {
+			reverse_proxy "https://http.cat" {
 				header_up Host {upstream_hostport}
 				replace_status {err.status_code}
 			}
@@ -97,24 +117,5 @@ git.fromchat.ru {
 	reverse_proxy 172.18.0.1:3000 host.docker.internal:3000 172.17.0.1:3000 {
 		lb_policy first
         header_up X-Real-IP {remote_host}
-	}
-
-	# Security headers
-	header {
-		X-XSS-Protection "1; mode=block" # Prevent XSS attacks
-		X-Content-Type-Options "nosniff" # Prevent MIME type sniffing
-		X-Frame-Options "DENY" # Prevent clickjacking
-		Referrer-Policy "strict-origin-when-cross-origin"
-		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
-		Permissions-Policy "geolocation=(), microphone=(), camera=()"
-	}
-
-	rate_limit {
-		zone global {
-			key {remote_ip}
-			window 1m
-			burst 20
-			events 500
-		}
 	}
 }

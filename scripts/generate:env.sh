@@ -2,11 +2,11 @@
 # =============================================================================
 # _ENV_TEMPLATE: one KEY=value per line. Use <set> for stdin prompts. Use
 # <gen:…> only where a dedicated step is needed. Any $(command) here runs when
-# this script executes (after cd "$ROOT"). Piped stdin order: two <set> lines
-# (DEPLOYMENT_SERVER, RELEASES_TOKEN),
-# then commit (y/n), then deployment output directory (blank = deployment), then
-# writes <dir>/.env and <dir>/compliance_keypair.txt (default dir: deployment); then
-# if each target exists, backup prompt [Y/n] (Enter = yes; only n/no skips).
+# this script executes (after cd "$ROOT"). Piped stdin order:
+# DEPLOYMENT_SERVER, RELEASES_TOKEN, UPDATER_TOKEN, then commit (y/n),
+# then output .env file path (blank = ../deployment/.env.prod). Writes that file and
+# compliance_keypair.txt (default: data/dev/compliance_keypair.txt).
+# If each target exists, backup prompt [Y/n] (Enter = yes; only n/no skips).
 # Nothing is written until commit=y (including compliance_keypair.txt). Backups after commit=y, default yes.
 # Backups use <original-path>.<6-char sha256>.bak (same contents reuse one file). If that
 # name exists with different content, full 64-char hash is used before .bak.
@@ -34,6 +34,7 @@ MAIN_DB_PASSWORD=$(openssl rand -hex 8 </dev/null)
 MESSAGING_DB_PASSWORD=$(openssl rand -hex 8 </dev/null)
 FILE_STORAGE_DB_PASSWORD=$(openssl rand -hex 8 </dev/null)
 RELEASES_TOKEN=<set>
+UPDATER_TOKEN=<set>
 MESSAGE_RETENTION_DAYS=180
 EOF
 )"
@@ -254,7 +255,7 @@ read_yes_default_yes() {
 }
 
 # Sets global named by $1 to trimmed read line or default $2; $3 = stderr label.
-prompt_output_path() {
+prompt_output_file() {
   local _out_var="$1" _default="$2" _label="$3" _line
   printf '%b%s%b ' "$GRAY" "$_label" "$NC" >&2
   printf '[%s]: ' "$_default" >&2
@@ -281,12 +282,10 @@ if ! read_yes "Write generated files? [y/N]: "; then
   exit 1
 fi
 
-prompt_output_path DEPLOY_OUTPUT_DIR "." "Output directory for .env (under repo)"
-DEPLOY_OUTPUT_DIR="${DEPLOY_OUTPUT_DIR%/}"
-if [[ "$DEPLOY_OUTPUT_DIR" != /* ]]; then
-  DEPLOY_OUTPUT_DIR="${ROOT}/${DEPLOY_OUTPUT_DIR}"
+prompt_output_file ENV_PATH "../deployment/.env.prod" "Output path for .env file (relative to repo root)"
+if [[ "$ENV_PATH" != /* ]]; then
+  ENV_PATH="${ROOT}/${ENV_PATH}"
 fi
-ENV_PATH="${DEPLOY_OUTPUT_DIR}/.env"
 COMPLIANCE_TXT="${ROOT}/data/dev/compliance_keypair.txt"
 
 if [[ -f "$ENV_PATH" ]] && read_yes_default_yes "File exists: ${ENV_PATH}. Create backup before overwrite? [Y/n]: "; then
