@@ -1,5 +1,5 @@
 services:
-  main:
+  backend:
     build:
       context: .
       dockerfile: src/Dockerfile
@@ -74,7 +74,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      main:
+      backend:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "python3", "/usr/local/bin/healthcheck.py"]
@@ -114,7 +114,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      main:
+      backend:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "python3", "/usr/local/bin/healthcheck.py"]

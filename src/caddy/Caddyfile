@@ -46,7 +46,7 @@ fromchat.ru {
 	rate_limit {
 		zone global {
 			match {
-				not path /.well-known/acme-challenge/*
+				not path "/.well-known/acme-challenge/*"
 			}
 			key {remote_ip}
 			window 1m
@@ -71,7 +71,7 @@ fromchat.ru {
 }
 
 api.fromchat.ru {
-    reverse_proxy main:8300 {
+    reverse_proxy backend:8300 {
         header_up X-Real-IP {remote_host}
     }
 
