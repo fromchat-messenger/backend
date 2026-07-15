@@ -1,0 +1,10 @@
+# Static LiveKit SFU settings (baked into fromchat/livekit).
+# API keys come from LIVEKIT_KEYS at runtime (.env → LIVEKIT_API_KEY / LIVEKIT_API_SECRET).
+port: 8303
+
+rtc:
+  tcp_port: 8304
+  # Narrow range for docker compose — enough for local 1:1 calls; avoids binding 10k host UDP ports.
+  port_range_start: 50000
+  port_range_end: 50100
+  use_external_ip: false

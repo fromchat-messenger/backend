@@ -1,5 +1,5 @@
-# Local LiveKit SFU for FromChat development.
-# Match keys in .env — see src/livekit/local.env.example
+# Local LiveKit SFU for FromChat development (native `npm run livekit:run`).
+# Match keys in .env (npm run generate:env). Docker compose passes them via LIVEKIT_KEYS.
 port: 8303
 
 rtc:

@@ -294,7 +294,6 @@ if add_security_middleware:
     add_security_middleware(app)
 
 # CORS
-_lan_ip = os.getenv("LAN_IP", "").strip()
 _cors_origins = [
     "https://fromchat.ru",
     "https://beta.fromchat.ru",
@@ -304,13 +303,6 @@ _cors_origins = [
     "http://localhost:8301",
     "http://localhost:8300",
 ]
-if _lan_ip:
-    _cors_origins.extend(
-        [
-            f"http://{_lan_ip}:8301",
-            f"http://{_lan_ip}:8300",
-        ]
-    )
 
 app.add_middleware(
     CORSMiddleware,

@@ -22,9 +22,6 @@ logger = logging.getLogger("uvicorn.error")
 
 
 def _default_file_storage_base_url() -> str:
-    lan = os.getenv("LAN_IP", "").strip()
-    if lan:
-        return f"http://{lan}:8302"
     return "http://127.0.0.1:8302"
 
 

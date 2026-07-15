@@ -29,6 +29,8 @@ $(.venv/bin/python3 src/main/generate_vapid_keys.py </dev/null)
 JWT_SECRET=$(openssl rand -base64 32 </dev/null | tr -d '\n')
 COMPLIANCE_PUBLIC_KEY=<gen:compliance>
 DEPLOYMENT_SERVER=<set>
+LIVEKIT_API_KEY=<gen:livekit_key>
+LIVEKIT_API_SECRET=<gen:livekit_secret>
 POSTGRES_PASSWORD=$(openssl rand -hex 8 </dev/null)
 MAIN_DB_PASSWORD=$(openssl rand -hex 8 </dev/null)
 MESSAGING_DB_PASSWORD=$(openssl rand -hex 8 </dev/null)
@@ -165,6 +167,19 @@ _do_backup_copy() {
   cp "$src" "$dest"
 }
 
+run_gen_livekit_key() {
+  local key="fromchat_$(openssl rand -hex 8 </dev/null)"
+  print_kv_row "generated " "$LIME" "LIVEKIT_API_KEY" "$key"
+  buffer_env_line "LIVEKIT_API_KEY" "$key"
+}
+
+run_gen_livekit_secret() {
+  local secret
+  secret="$(openssl rand -base64 32 </dev/null | tr -d '\n')"
+  print_kv_row "generated " "$LIME" "LIVEKIT_API_SECRET" "$secret"
+  buffer_env_line "LIVEKIT_API_SECRET" "$secret"
+}
+
 run_gen_compliance() {
   local tmp
   tmp="$(mktemp "${TMPDIR:-/tmp}/fromchat-compliance.XXXXXX")"
@@ -223,6 +238,12 @@ process_line() {
       ;;
     \<gen:compliance\>)
       run_gen_compliance
+      ;;
+    \<gen:livekit_key\>)
+      run_gen_livekit_key
+      ;;
+    \<gen:livekit_secret\>)
+      run_gen_livekit_secret
       ;;
     *)
       if [[ "$rhs" == \<gen:* ]]; then

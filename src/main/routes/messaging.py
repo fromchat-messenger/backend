@@ -170,12 +170,10 @@ def _public_attachment_media_fields_sync(msg: Message) -> dict:
 
 
 def _get_file_storage_url() -> str:
-    lan = os.getenv("LAN_IP", "").strip()
-    default_fs = f"http://{lan}:8302" if lan else "http://127.0.0.1:8302"
     return (
         os.getenv("FILE_STORAGE_SERVICE_URL")
         or os.getenv("FILE_STORAGE_URL")
-        or default_fs
+        or "http://127.0.0.1:8302"
     )
 
 _SPAM_WINDOW_SECONDS = 45

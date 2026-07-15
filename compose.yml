@@ -20,7 +20,6 @@ services:
       MESSAGE_RETENTION_DAYS: ${MESSAGE_RETENTION_DAYS}
       LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-fromchat_dev}
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-local_dev_secret_must_be_at_least_32_characters_long}
-      LIVEKIT_URL: ws://livekit:8303
     ports:
       - "8300:8300"
     volumes:
@@ -134,11 +133,15 @@ services:
           path: ./requirements.txt
 
   livekit:
-    image: livekit/livekit-server:v1.8.4
+    build:
+      context: ./src/livekit
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      LIVEKIT_KEYS: "${LIVEKIT_API_KEY:-fromchat_dev}: ${LIVEKIT_API_SECRET:-local_dev_secret_must_be_at_least_32_characters_long}"
     command: --config /etc/livekit.yaml
     restart: unless-stopped
-    volumes:
-      - ./src/livekit/compose.yaml:/etc/livekit.yaml:ro
     ports:
       - "8303:8303"
       - "8304:8304"
@@ -164,13 +167,13 @@ services:
     restart: unless-stopped
 
   haproxy:
-    image: haproxy:2.9-alpine
+    build:
+      context: ./src/haproxy
+      dockerfile: Dockerfile
     # Host network so UFW can filter 80/443 (Docker-published ports bypass UFW).
     network_mode: host
     # Image defaults to user haproxy; need root to bind :80/:443, then cfg drops privileges.
     user: "0:0"
-    volumes:
-      - ./src/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     depends_on:
       - caddy
     restart: unless-stopped

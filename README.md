@@ -113,8 +113,7 @@ API_URL=https://api.fromchat.ru  # Для production
 FIREBASE_ENABLED=false
 FIREBASE_CREDENTIALS_PATH=/path/to/firebase-cert.json
 
-# LiveKit (опционально, для видеозвонков)
-LIVEKIT_URL=wss://livekit.your-domain.com
+# LiveKit (optional, for calls — clients connect to host:8303 themselves)
 LIVEKIT_API_KEY=your_api_key
 LIVEKIT_API_SECRET=your_api_secret
 ```

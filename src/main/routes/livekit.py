@@ -1,6 +1,9 @@
 """
-Mint LiveKit participant JWTs for DM calls. Requires LIVEKIT_API_KEY, LIVEKIT_API_SECRET,
-and LIVEKIT_URL (WebSocket URL for clients, e.g. wss://livekit.example.com or ws://host:7880).
+Mint LiveKit participant JWTs for DM calls.
+
+Requires LIVEKIT_API_KEY and LIVEKIT_API_SECRET.
+Clients connect to LiveKit themselves using the configured server host on port 8303 —
+this endpoint only returns a token and room name.
 """
 from __future__ import annotations
 
@@ -30,21 +33,19 @@ class LiveKitTokenRequest(BaseModel):
 
 
 class LiveKitTokenResponse(BaseModel):
-    server_url: str
     token: str
     room_name: str
 
 
-def _livekit_env() -> tuple[str, str, str]:
+def _livekit_credentials() -> tuple[str, str]:
     api_key = os.getenv("LIVEKIT_API_KEY", "").strip()
     api_secret = os.getenv("LIVEKIT_API_SECRET", "").strip()
-    server_url = os.getenv("LIVEKIT_URL", "").strip()
-    if not api_key or not api_secret or not server_url:
+    if not api_key or not api_secret:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="LiveKit is not configured (LIVEKIT_API_KEY / LIVEKIT_API_SECRET / LIVEKIT_URL)",
+            detail="LiveKit is not configured (LIVEKIT_API_KEY / LIVEKIT_API_SECRET)",
         )
-    return api_key, api_secret, server_url
+    return api_key, api_secret
 
 
 @router.post("/token", response_model=LiveKitTokenResponse)
@@ -63,7 +64,7 @@ async def create_livekit_token(
     if not peer:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Peer user not found")
 
-    api_key, api_secret, server_url = _livekit_env()
+    api_key, api_secret = _livekit_credentials()
 
     if body.room_name and body.room_name.strip():
         room_name = body.room_name.strip()
@@ -95,6 +96,4 @@ async def create_livekit_token(
         .with_grants(grants)
     )
 
-    jwt_token = token.to_jwt()
-
-    return LiveKitTokenResponse(server_url=server_url, token=jwt_token, room_name=room_name)
+    return LiveKitTokenResponse(token=token.to_jwt(), room_name=room_name)
