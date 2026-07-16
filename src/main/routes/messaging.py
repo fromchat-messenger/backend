@@ -249,6 +249,13 @@ def _monitor_public_message_activity(user: User, content: str, message_id: int, 
         # Delete spam messages that triggered the ban
         if message_ids_to_delete:
             try:
+                db.query(Message).filter(Message.reply_to_id.in_(message_ids_to_delete)).update(
+                    {Message.reply_to_id: None},
+                    synchronize_session=False,
+                )
+                db.query(MessageEditHistory).filter(
+                    MessageEditHistory.message_id.in_(message_ids_to_delete)
+                ).delete(synchronize_session=False)
                 deleted_count = db.query(Message).filter(Message.id.in_(message_ids_to_delete)).delete(synchronize_session=False)
                 db.commit()
                 logger.info(f"Deleted {deleted_count} spam messages for user {user.id}")
@@ -1862,6 +1869,14 @@ async def delete_message(
         raise HTTPException(status_code=403, detail="You can only delete your own messages")
 
     original_content = message.content
+    # Clear reply references so hard-delete is not blocked by the self-FK on reply_to_id
+    db.query(Message).filter(Message.reply_to_id == message_id).update(
+        {Message.reply_to_id: None},
+        synchronize_session=False,
+    )
+    db.query(MessageEditHistory).filter(MessageEditHistory.message_id == message_id).delete(
+        synchronize_session=False,
+    )
     db.delete(message)
     db.commit()
 
