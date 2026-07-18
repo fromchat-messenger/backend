@@ -24,6 +24,44 @@ _REJECTED_FLAG_PAIRS: FrozenSet[Tuple[int, int]] = frozenset(
 _REGIONAL_A = 0x1F1E6
 _REGIONAL_Z = 0x1F1FF
 
+# Phonetic Extensions / IPA glyphs used as Cyrillic (and Latin) lookalikes.
+# Keys are integer codepoints so the glyphs need not appear as source literals elsewhere.
+_PHONETIC_LOOKALIKE_TO_CYR: Dict[int, str] = {
+    0x1D00: "а",  # ᴀ
+    0x1D04: "с",  # ᴄ
+    0x1D07: "е",  # ᴇ
+    0x1D0B: "к",  # ᴋ
+    0x1D1B: "т",  # ᴛ
+    0x1D20: "в",  # ᴠ
+    0x1D22: "з",  # ᴢ
+    0x1D26: "г",  # ᴦ
+    0x1D27: "л",  # ᴧ
+    0x1D28: "п",  # ᴨ
+    0x1D29: "р",  # ᴩ
+    0x028D: "м",  # ʍ turned w
+    0x026F: "ш",  # ɯ turned m (visually ш-like in this bypass set)
+    0x0299: "в",  # ʙ
+    0x0278: "ф",  # ɸ
+}
+
+_PHONETIC_LOOKALIKE_TO_ASCII: Dict[int, str] = {
+    0x1D00: "a",
+    0x1D04: "c",
+    0x1D07: "e",
+    0x1D0B: "k",
+    0x1D1B: "t",
+    0x1D20: "v",
+    0x1D22: "z",
+    0x1D26: "g",
+    0x1D27: "l",
+    0x1D28: "p",
+    0x1D29: "r",
+    0x028D: "m",
+    0x026F: "m",
+    0x0299: "b",
+    0x0278: "f",
+}
+
 
 def _range_set(start: int, end: int) -> set[int]:
     return set(range(start, end + 1))
@@ -124,6 +162,9 @@ def _build_allowed_codepoints() -> FrozenSet[int]:
         0x03C6,
         0x03A6,
     }
+
+    # Phonetic Extensions / IPA small-caps & turned letters used as Cyrillic lookalikes
+    allowed |= set(_PHONETIC_LOOKALIKE_TO_CYR.keys())
 
     return frozenset(allowed)
 
@@ -299,6 +340,7 @@ def _build_replacement_map() -> Dict[int, str]:
         0x03A6: "ф",
     }
     m.update(greek)
+    m.update(_PHONETIC_LOOKALIKE_TO_CYR)
 
     return m
 
@@ -360,6 +402,7 @@ def _build_ascii_replacement_map() -> Dict[int, str]:
         m[cp] = chr(cp)
     for cp in range(ord("0"), ord("9") + 1):
         m[cp] = chr(cp)
+    m.update(_PHONETIC_LOOKALIKE_TO_ASCII)
     return m
 
 
@@ -434,17 +477,36 @@ def map_to_ascii_letters(text: str) -> str:
     return "".join(out)
 
 
+# Single-position swaps for leet / latin / greek ambiguity after primary mapping.
+# у↔и: latin u; е→з: digit 3 as з; р→п: greek rho used as п-lookalike.
+_AMBIGUOUS_LETTER_SWAPS: Tuple[Tuple[str, str], ...] = (
+    ("у", "и"),
+    ("и", "у"),
+    ("е", "з"),
+    ("р", "п"),
+)
+
+
 def cyrillic_alternates(normalized: str) -> Tuple[str, ...]:
-    """Include a form where у after consonant-like х may be й (хyuню → хуйню)."""
+    """Expand normalized text with common leet/latin/homoglyph ambiguities."""
     alts = {normalized}
-    # Replace "хуу" → "хуй" and lone mapped "yu" patterns: уу → уй when after х
     if "хуу" in normalized:
         alts.add(normalized.replace("хуу", "хуй"))
-    # Also try global у→й only at positions after х
     chars = list(normalized)
     for i in range(1, len(chars)):
         if chars[i] == "у" and chars[i - 1] == "х":
             trial = chars.copy()
             trial[i] = "й"
             alts.add("".join(trial))
+
+    # One substitution each — enough for пuдорaс / 3еленский / ρутин style bypasses.
+    seed = list(alts)
+    for form in seed:
+        form_chars = list(form)
+        for i, ch in enumerate(form_chars):
+            for src, dst in _AMBIGUOUS_LETTER_SWAPS:
+                if ch == src:
+                    trial = form_chars.copy()
+                    trial[i] = dst
+                    alts.add("".join(trial))
     return tuple(alts)
