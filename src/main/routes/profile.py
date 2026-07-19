@@ -3,6 +3,7 @@ import logging
 import re
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from fastapi.responses import FileResponse
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from PIL import Image
 import os
@@ -315,8 +316,15 @@ async def update_user_profile(
                 detail="Имя пользователя содержит запрещённые слова"
             )
         
-        # Check if username is already taken by another user
-        existing_user = db.query(User).filter(User.username == username, User.id != current_user.id).first()
+        # Case-insensitive uniqueness; store typed casing as entered.
+        existing_user = (
+            db.query(User)
+            .filter(
+                func.lower(User.username) == username.lower(),
+                User.id != current_user.id,
+            )
+            .first()
+        )
         if existing_user:
             raise HTTPException(status_code=400, detail="Это имя пользователя уже занято")
         
@@ -427,8 +435,12 @@ async def get_user_by_username(
     """
     if not username or not is_valid_username(username):
         raise HTTPException(status_code=400, detail="Invalid username format")
-    
-    user = db.query(User).filter(User.username == username).first()
+
+    user = (
+        db.query(User)
+        .filter(func.lower(User.username) == username.lower())
+        .first()
+    )
     
     if not user:
         raise HTTPException(status_code=404, detail="User not found")

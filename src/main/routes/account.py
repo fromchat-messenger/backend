@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status, Request
 from sqlalchemy.orm import Session
-from sqlalchemy import inspect, text
+from sqlalchemy import func, inspect, text
 import uuid
 import secrets
 from user_agents import parse as parse_ua
@@ -205,7 +205,12 @@ def check_username(request: Request, username: str, db: Session = Depends(get_db
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Username must be 3 to 20 characters and contain only English letters, digits, hyphens, and underscores",
         )
-    exists = db.query(User).filter(User.username == u).first() is not None
+    exists = (
+        db.query(User)
+        .filter(func.lower(User.username) == u.lower())
+        .first()
+        is not None
+    )
     return {"exists": exists}
 
 
@@ -218,7 +223,7 @@ def login(request: Request, login_request: LoginRequest, db: Session = Depends(g
     import logging
     logging.getLogger("uvicorn.error").info("Login attempt start for username=%s ip=%s", username, client_ip)
 
-    user = db.query(User).filter(User.username == username).first()
+    user = db.query(User).filter(func.lower(User.username) == username.lower()).first()
     logging.getLogger("uvicorn.error").info("Queried user from DB for username=%s -> %s", username, "FOUND" if user else "NOT FOUND")
 
     if not user or not verify_password(login_request.password.strip(), user.password_hash):
@@ -329,7 +334,12 @@ def register(
     raw_ua = request.headers.get("user-agent")
 
     # Determine if owner already exists
-    owner_exists = db.query(User).filter(User.username == OWNER_USERNAME).first() is not None
+    owner_exists = (
+        db.query(User)
+        .filter(func.lower(User.username) == OWNER_USERNAME.lower())
+        .first()
+        is not None
+    )
 
     # Validate input
     if not is_valid_username(username):
@@ -366,7 +376,14 @@ def register(
             detail="Пароли не совпадают"
         )
 
-    existing_user = db.query(User).filter(User.username == username).first()
+    # Case-insensitive uniqueness; store typed casing as entered.
+    # Note: DB unique=True on username remains case-sensitive; a unique index on
+    # lower(username) would harden this at the schema level (no migration here).
+    existing_user = (
+        db.query(User)
+        .filter(func.lower(User.username) == username.lower())
+        .first()
+    )
     if existing_user:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -388,7 +405,7 @@ def register(
     hashed_password = get_password_hash(password)
     
     # Set verified=True for the owner (first user to register)
-    is_owner = not owner_exists and username == OWNER_USERNAME
+    is_owner = not owner_exists and username.lower() == OWNER_USERNAME.lower()
     
     new_user = User(
         id=allocate_user_id(db),

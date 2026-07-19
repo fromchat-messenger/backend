@@ -19,7 +19,7 @@ from ..dependencies import get_current_user, get_current_user_allow_suspended, g
 from .account import convert_user_for_dm_conversation
 from ..deleted_user import deleted_username_for, is_deleted_or_suspended, is_deleted_user, is_suspended_user, public_display_username
 from ..constants import OWNER_USERNAME, DATA_DIR, FILE_STORAGE_SERVICE_URL
-from ..models import Message, SendMessageRequest, EditMessageRequest, User, DMEnvelope, DmConversationPreference, MessageFile, DMFile, Reaction, ReactionRequest, ReactionResponse, DMReaction, DMReactionRequest, DMReactionResponse, UpdateLog, MessageEditHistory, MessageEditHistoryResponse
+from ..models import Message, SendMessageRequest, EditMessageRequest, User, DMEnvelope, DmConversationPreference, MessageFile, DMFile, Reaction, ReactionRequest, ReactionResponse, DMReaction, DMReactionRequest, DMReactionResponse, UpdateLog, MessageEditHistory, MessageEditHistoryResponse, DeviceSession
 from ..presence_service import presence_service
 from ..push_service import push_service
 from src.shared.public_image_dimensions import (
@@ -1949,14 +1949,22 @@ class MessaggingSocketManager:
         self.dm_typing_state: dict[int, dict[int, bool]] = {}  # user_id -> {recipient_id -> is_typing}
         self.ws_subscriptions: dict[WebSocket, set[int]] = {}  # websocket -> set of subscribed user_ids
         self._cleanup_task = None
-        # Update system: sequence numbers and batching
+        # Update system: per-user sequence + durable log (multi-device safe)
         self.sequence_numbers: dict[int, int] = {}  # user_id -> current sequence number
-        self.pending_updates: dict[WebSocket, list[dict]] = {}  # websocket -> list of pending updates
-        self.update_batch_tasks: dict[WebSocket, asyncio.Task] = {}  # websocket -> batch task
-        self.last_seq_by_ws: dict[WebSocket, int] = {}  # websocket -> last received sequence number
+        self.pending_updates_by_user: dict[int, list[dict]] = {}  # user_id -> pending updates
+        self.update_batch_tasks_by_user: dict[int, asyncio.Task] = {}  # user_id -> batch task
+        self.last_seq_by_ws: dict[WebSocket, int] = {}  # websocket -> last acked sequence
         self.stored_sequences: dict[tuple[int, int], bool] = {}  # (user_id, sequence) -> stored flag
-        self.recent_updates: dict[WebSocket, set[str]] = {}  # websocket -> set of recent update signatures
+        self.recent_updates_by_user: dict[int, set[str]] = {}  # user_id -> recent signatures
         self._sequence_lock: dict[int, asyncio.Lock] = {}  # user_id -> lock for sequence generation
+        # Ephemeral updates are live-only (not written to UpdateLog / not for offline catch-up)
+        self._ephemeral_update_types = {
+            "typing", "stopTyping", "dmTyping", "stopDmTyping", "statusUpdate",
+            "registeredUserCount",
+        }
+        self.get_updates_too_long_threshold = 500
+        self.get_updates_chunk_size = 50
+        self.update_log_retention_days = 14
 
     async def send_error(self, websocket: WebSocket, type: str, e: HTTPException):
         if websocket.client_state.name == "CONNECTED":
@@ -2049,119 +2057,193 @@ class MessaggingSocketManager:
         sig_json = json.dumps(sig_data, sort_keys=True)
         return hashlib.md5(sig_json.encode()).hexdigest()
 
-    def _add_update(self, websocket: WebSocket, update: dict):
-        """Add an update to the pending batch for a WebSocket (with deduplication)"""
-        if websocket not in self.pending_updates:
-            self.pending_updates[websocket] = []
-        
-        # Check for duplicates
+    def _add_update_for_user(self, user_id: int, update: dict) -> bool:
+        """Add an update to the pending batch for a user (with deduplication). Returns False if skipped."""
+        if user_id not in self.pending_updates_by_user:
+            self.pending_updates_by_user[user_id] = []
+
         signature = self._get_update_signature(update)
-        if websocket not in self.recent_updates:
-            self.recent_updates[websocket] = set()
-        
-        # Skip if this exact update was recently added
-        if signature in self.recent_updates[websocket]:
+        if user_id not in self.recent_updates_by_user:
+            self.recent_updates_by_user[user_id] = set()
+
+        if signature in self.recent_updates_by_user[user_id]:
             logger.warning(f"Update was skipped due to duplicate signature {signature}")
-            return
-        
-        # Add to pending updates and track signature
-        self.pending_updates[websocket].append(update)
-        self.recent_updates[websocket].add(signature)
-        
-        # Limit recent updates cache size (keep last 100 signatures per websocket)
-        if len(self.recent_updates[websocket]) > 1:
-            self.recent_updates[websocket] = set(list(self.recent_updates[websocket])[-1])
+            return False
 
-    async def _flush_updates(self, websocket: WebSocket, db: Session | None = None):
-        """Flush pending updates for a WebSocket connection"""
-        if websocket not in self.pending_updates or not self.pending_updates[websocket]:
-            return
+        self.pending_updates_by_user[user_id].append(update)
+        self.recent_updates_by_user[user_id].add(signature)
 
-        updates = self.pending_updates[websocket]
-        self.pending_updates[websocket] = []
-        
-        # Clear recent updates cache after flushing (updates are now sent, can be re-added if needed)
-        if websocket in self.recent_updates:
-            # Keep only the last 50 signatures to allow some deduplication across batches
-            recent_list = list(self.recent_updates[websocket])
-            if len(recent_list) > 50:
-                self.recent_updates[websocket] = set(recent_list[-50:])
-            else:
-                # Keep all if under limit
+        if len(self.recent_updates_by_user[user_id]) > 100:
+            self.recent_updates_by_user[user_id] = set(list(self.recent_updates_by_user[user_id])[-50:])
+        return True
+
+    def _websockets_for_user(self, user_id: int) -> list[WebSocket]:
+        return [
+            websocket
+            for websocket, uid in self.user_by_ws.items()
+            if uid == user_id
+        ]
+
+    def _public_update_recipient_ids(self, db: Session | None) -> set[int]:
+        """Connected users plus anyone with a non-revoked device session (offline catch-up)."""
+        ids = set(self.user_by_ws.values())
+        if db is None:
+            return ids
+        try:
+            rows = (
+                db.query(DeviceSession.user_id)
+                .filter(DeviceSession.revoked.is_(False))
+                .distinct()
+                .all()
+            )
+            ids.update(uid for (uid,) in rows if uid is not None)
+        except Exception as e:
+            logger.warning(f"Failed to load device-session recipients for updates: {e}")
+        return ids
+
+    def get_current_sequence(self, user_id: int, db: Session | None = None) -> int:
+        """Return the latest known sequence for a user (memory, else DB)."""
+        if user_id in self.sequence_numbers:
+            return self.sequence_numbers[user_id]
+        if db is not None:
+            try:
+                latest = (
+                    db.query(UpdateLog)
+                    .filter(UpdateLog.user_id == user_id)
+                    .order_by(UpdateLog.sequence.desc())
+                    .first()
+                )
+                seq = latest.sequence if latest else 0
+                self.sequence_numbers[user_id] = seq
+                return seq
+            except Exception:
+                return 0
+        return 0
+
+    def prune_update_log(self, db: Session, user_id: int | None = None) -> int:
+        """Drop UpdateLog rows older than retention. Never prune by a single device ack."""
+        from datetime import timedelta
+        cutoff = datetime.now() - timedelta(days=self.update_log_retention_days)
+        try:
+            query = db.query(UpdateLog).filter(UpdateLog.timestamp < cutoff)
+            if user_id is not None:
+                query = query.filter(UpdateLog.user_id == user_id)
+            deleted = query.delete(synchronize_session=False)
+            db.commit()
+            return deleted or 0
+        except Exception as e:
+            try:
+                db.rollback()
+            except Exception:
                 pass
+            logger.warning(f"Failed to prune update_log: {e}")
+            return 0
 
-        if updates:
-            user_id = self.user_by_ws.get(websocket)
-            if not user_id:
-                # No user associated - this shouldn't happen for authenticated connections
-                # Skip sending to avoid seq: 0 issues
-                logger.warning(f"Attempted to flush updates for unauthenticated websocket, skipping")
-                return
-            
-            seq = await self._get_next_sequence(user_id, db)
-            
-            # Store updates in database for gap detection (only once per user per sequence)
-            if db:
-                sequence_key = (user_id, seq)
-                # Double-check pattern: check again after getting sequence (in case another connection got the same sequence)
-                if sequence_key not in self.stored_sequences:
+    async def _flush_user_updates(self, user_id: int, db: Session | None = None):
+        """Flush pending updates for a user: durable UpdateLog + fan-out to all devices."""
+        pending = self.pending_updates_by_user.get(user_id) or []
+        if not pending:
+            return
+
+        self.pending_updates_by_user[user_id] = []
+
+        durable = [u for u in pending if u.get("type") not in self._ephemeral_update_types]
+        ephemeral = [u for u in pending if u.get("type") in self._ephemeral_update_types]
+
+        sockets = self._websockets_for_user(user_id)
+
+        # Ephemeral: live sockets only, no seq / no UpdateLog
+        if ephemeral and sockets:
+            for websocket in sockets:
+                if websocket.client_state.name != "CONNECTED":
+                    continue
+                try:
+                    await websocket.send_json({
+                        "type": "updates",
+                        "seq": self.get_current_sequence(user_id, db),
+                        "updates": ephemeral,
+                    })
+                except Exception as e:
+                    logger.debug(f"Failed to send ephemeral updates to user {user_id}: {e}")
+
+        if not durable:
+            return
+
+        # Offline users still get a durable log entry even with zero sockets
+        seq = await self._get_next_sequence(user_id, db)
+
+        if db:
+            sequence_key = (user_id, seq)
+            if sequence_key not in self.stored_sequences:
+                try:
+                    update_log = UpdateLog(
+                        user_id=user_id,
+                        sequence=seq,
+                        updates=json.dumps(durable),
+                    )
+                    db.add(update_log)
+                    db.commit()
+                    self.stored_sequences[sequence_key] = True
+                    # Best-effort retention prune (multi-device safe: age-based only)
+                    if seq % 50 == 0:
+                        self.prune_update_log(db, user_id=user_id)
+                except Exception as e:
                     try:
-                        import json
-                        # Store the entire batch as a single record
-                        update_log = UpdateLog(
-                            user_id=user_id,
-                            sequence=seq,
-                            updates=json.dumps(updates)
-                        )
-                        db.add(update_log)
-                        db.commit()
+                        db.rollback()
+                    except Exception:
+                        pass
+                    if "UNIQUE constraint" in str(e) or "IntegrityError" in str(e.__class__.__name__):
                         self.stored_sequences[sequence_key] = True
-                    except Exception as e:
-                        # Always rollback on error to reset session state
-                        try:
-                            db.rollback()
-                        except Exception:
-                            pass  # Ignore rollback errors
-                        
-                        # If we get a UNIQUE constraint error, it means another connection already stored this sequence
-                        # This is expected behavior when multiple connections exist for the same user
-                        if "UNIQUE constraint" in str(e) or "IntegrityError" in str(e.__class__.__name__):
-                            # Mark as stored to prevent future attempts
-                            self.stored_sequences[sequence_key] = True
-                            logger.debug(f"Update sequence {seq} for user {user_id} already stored by another connection (expected)")
-                        else:
-                            logger.warning(f"Unexpected error storing updates in database: {e}")
-                else:
-                    # Already stored, skip
-                    logger.debug(f"Update sequence {seq} for user {user_id} already marked as stored")
-            
-            # Only send if WebSocket is still connected
-            if websocket.client_state.name == "CONNECTED":
+                        logger.debug(
+                            f"Update sequence {seq} for user {user_id} already stored by another connection (expected)"
+                        )
+                    else:
+                        logger.warning(f"Unexpected error storing updates in database: {e}")
+
+        for websocket in sockets:
+            if websocket.client_state.name != "CONNECTED":
+                continue
+            try:
                 await websocket.send_json({
                     "type": "updates",
                     "seq": seq,
-                    "updates": updates
+                    "updates": durable,
                 })
-            else:
-                logger.debug(f"WebSocket already closed, skipping update send for sequence {seq}")
+            except Exception as e:
+                logger.debug(f"Failed to send updates seq={seq} to user {user_id}: {e}")
 
-    async def _schedule_batch_flush(self, websocket: WebSocket, db: Session | None = None):
-        """Schedule a batch flush after a delay (50-100ms)"""
-        if websocket in self.update_batch_tasks:
-            self.update_batch_tasks[websocket].cancel()
-        
+    async def _schedule_user_batch_flush(self, user_id: int, db: Session | None = None):
+        """Schedule a per-user batch flush after a short delay."""
+        if user_id in self.update_batch_tasks_by_user:
+            self.update_batch_tasks_by_user[user_id].cancel()
+
         async def flush_after_delay():
-            await asyncio.sleep(0.075)  # 75ms delay for batching
-            await self._flush_updates(websocket, db)
-            if websocket in self.update_batch_tasks:
-                del self.update_batch_tasks[websocket]
-        
-        self.update_batch_tasks[websocket] = asyncio.create_task(flush_after_delay())
+            await asyncio.sleep(0.075)
+            await self._flush_user_updates(user_id, db)
+            if user_id in self.update_batch_tasks_by_user:
+                del self.update_batch_tasks_by_user[user_id]
+
+        self.update_batch_tasks_by_user[user_id] = asyncio.create_task(flush_after_delay())
+
+    async def enqueue_update_for_user(
+        self,
+        user_id: int,
+        update_type: str,
+        update_data: dict,
+        db: Session | None = None,
+    ):
+        """Queue an update for a user (logged even if they have no live connections)."""
+        if not self._add_update_for_user(user_id, {"type": update_type, "data": update_data}):
+            return
+        await self._schedule_user_batch_flush(user_id, db)
 
     async def _send_update(self, websocket: WebSocket, update_type: str, update_data: dict, db: Session | None = None):
-        """Send an update (will be batched)"""
-        self._add_update(websocket, {"type": update_type, "data": update_data})
-        await self._schedule_batch_flush(websocket, db)
+        """Send an update via the user's durable queue (requires authenticated websocket)."""
+        user_id = self.user_by_ws.get(websocket)
+        if user_id is None:
+            logger.warning("Attempted to send update on unauthenticated websocket, skipping")
+            return
+        await self.enqueue_update_for_user(user_id, update_type, update_data, db)
 
     async def handle_connection(self, websocket: WebSocket, db: Session):
         # Initialize subscriptions for this connection
@@ -2199,6 +2281,14 @@ class MessaggingSocketManager:
                     await self.send_error(websocket, message_type, e)
                 except WebSocketDisconnect:
                     raise  # Re-raise to close connection
+                except (TypeError, ValueError, KeyError) as e:
+                    # Client payload errors (missing/invalid fields) — not internal 500s.
+                    logger.warning(f"Client error in handler for {message_type}: {e}")
+                    await self.send_error(
+                        websocket,
+                        message_type,
+                        HTTPException(400, "Invalid request"),
+                    )
                 except Exception as e:
                     logger.error(f"Error in handler for {message_type}: {e}")
                     await self.send_error(websocket, message_type, HTTPException(500, "Internal server error"))
@@ -2225,7 +2315,6 @@ class MessaggingSocketManager:
         )
         self.connections.append(websocket)
         # Initialize update system for this connection
-        self.pending_updates[websocket] = []
         self.last_seq_by_ws[websocket] = 0
         try:
             await self.handle_connection(websocket, db)
@@ -2240,15 +2329,15 @@ class MessaggingSocketManager:
                 reason=e.reason,
             )
         finally:
-            # Flush any pending updates before disconnecting
-            if websocket in self.pending_updates:
-                await self._flush_updates(websocket, db)
-            # Cancel any pending batch tasks
-            if websocket in self.update_batch_tasks:
-                self.update_batch_tasks[websocket].cancel()
-                del self.update_batch_tasks[websocket]
+            # Flush durable pending updates for this user before tearing down the socket
+            user_id = self.user_by_ws.get(websocket)
+            if user_id is not None and user_id in self.pending_updates_by_user:
+                await self._flush_user_updates(user_id, db)
             # Cleanup connection
-            self.connections.remove(websocket)
+            try:
+                self.connections.remove(websocket)
+            except ValueError:
+                pass
             if websocket in self.user_by_ws:
                 user_id = self.user_by_ws[websocket]
                 try:
@@ -2268,22 +2357,21 @@ class MessaggingSocketManager:
             # Cleanup subscriptions
             if websocket in self.ws_subscriptions:
                 del self.ws_subscriptions[websocket]
-            # Cleanup update system
-            if websocket in self.pending_updates:
-                del self.pending_updates[websocket]
             if websocket in self.last_seq_by_ws:
                 del self.last_seq_by_ws[websocket]
-            if websocket in self.recent_updates:
-                del self.recent_updates[websocket]
 
     async def broadcast(self, message: dict, db: Session | None = None):
-        """Broadcast a message to all authenticated connections as an update (batched)"""
+        """Broadcast a message to all recipients as a durable per-user update."""
         message_type = message.get("type", "")
         update_data = message.get("data", {})
-        for websocket in self.connections:
-            # Only send to authenticated websockets (those with user_id set)
-            if websocket in self.user_by_ws:
-                await self._send_update(websocket, message_type, update_data, db)
+        if message_type in self._ephemeral_update_types:
+            # Live-only: connected sockets
+            for websocket in self.connections:
+                if websocket in self.user_by_ws:
+                    await self._send_update(websocket, message_type, update_data, db)
+            return
+        for user_id in self._public_update_recipient_ids(db):
+            await self.enqueue_update_for_user(user_id, message_type, update_data, db)
 
     async def broadcast_new_message(
         self,
@@ -2293,19 +2381,15 @@ class MessaggingSocketManager:
         sender_client_message_id: str | None = None,
     ):
         """Broadcast newMessage; only the sender receives client_message_id when provided."""
-        sender_id = message.user_id
         verified_users_data = get_verified_users_data(db)
-        for websocket in self.connections:
-            viewer_id = self.user_by_ws.get(websocket)
-            if viewer_id is None:
-                continue
+        for viewer_id in self._public_update_recipient_ids(db):
             payload = convert_message_for_user(
                 message,
                 viewer_id,
                 sender_client_message_id=sender_client_message_id,
                 verified_users_data=verified_users_data,
             )
-            await self._send_update(websocket, "newMessage", payload, db)
+            await self.enqueue_update_for_user(viewer_id, "newMessage", payload, db)
 
     async def broadcast_registered_user_count(self, db: Session):
         """Notify all clients of the current non-deleted user count (public chat member count)."""
@@ -2319,10 +2403,8 @@ class MessaggingSocketManager:
             pass
 
     async def send_update_to_user(self, user_id: int, update_type: str, update_data: dict, db: Session | None = None):
-        """Send an update to a specific user (batched)"""
-        for websocket in self.connections:
-            if self.user_by_ws.get(websocket) == user_id:
-                await self._send_update(websocket, update_type, update_data, db)
+        """Send an update to a specific user (batched, durable even if offline)."""
+        await self.enqueue_update_for_user(user_id, update_type, update_data, db)
 
     async def send_to_user(self, user_id: int, message: dict):
         """Send a direct WebSocket message to a specific user (not batched)"""

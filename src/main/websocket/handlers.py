@@ -65,49 +65,108 @@ def log(manager: MessaggingSocketManager, websocket: WebSocket, user: User | Non
 
 @websocket_handler("getUpdates", authRequired=True)
 async def getUpdates(manager: MessaggingSocketManager, websocket: WebSocket, db: Session, user: User, data: dict) -> dict | None:
-    """Handle gap detection - client requests updates from a specific sequence number."""
-    last_seq = data.get("lastSeq", 0)
+    """Gap detection: replay durable updates since lastSeq, or signal tooLong for rebuild."""
+    last_seq = int(data.get("lastSeq", 0) or 0)
     manager.last_seq_by_ws[websocket] = last_seq
-    current_seq = manager.sequence_numbers.get(user.id, 0)
-    
-    # Query database for missed updates
-    missed_updates = []
-    if last_seq > 0 and last_seq < current_seq:
-        try:
-            # Get all updates between last_seq and current_seq
-            update_logs = db.query(UpdateLog).filter(
+    current_seq = manager.get_current_sequence(user.id, db)
+
+    if current_seq <= last_seq:
+        log(manager, websocket, user, "getUpdates", last_seq=last_seq, current_seq=current_seq, missed_count=0)
+        return {
+            "status": "ok",
+            "lastSeq": current_seq,
+            "missedCount": 0,
+            "hasMore": False,
+        }
+
+    gap = current_seq - last_seq
+
+    # Cold cursor or oversized / pruned gap → client must rebuild from history
+    if last_seq == 0 or gap > manager.get_updates_too_long_threshold:
+        log(
+            manager, websocket, user, "getUpdates",
+            last_seq=last_seq, current_seq=current_seq, missed_count=gap, status="tooLong",
+        )
+        return {
+            "status": "tooLong",
+            "lastSeq": current_seq,
+            "missedCount": gap,
+            "hasMore": False,
+        }
+
+    try:
+        update_logs = (
+            db.query(UpdateLog)
+            .filter(
                 UpdateLog.user_id == user.id,
                 UpdateLog.sequence > last_seq,
-                UpdateLog.sequence <= current_seq
-            ).order_by(UpdateLog.sequence.asc()).all()
-            
-            # Each log entry contains a batch of updates with the same sequence number
-            for log_entry in update_logs:
-                updates = json.loads(log_entry.updates)
-                missed_updates.append({
-                    "seq": log_entry.sequence,
-                    "updates": updates
-                })
-        except Exception as e:
-            logger.error(f"Failed to retrieve missed updates: {e}")
-    
-    # Send missed updates directly (not through return value)
-    for batch in missed_updates:
+                UpdateLog.sequence <= current_seq,
+            )
+            .order_by(UpdateLog.sequence.asc())
+            .limit(manager.get_updates_chunk_size)
+            .all()
+        )
+    except Exception as e:
+        logger.error(f"Failed to retrieve missed updates: {e}")
+        update_logs = []
+
+    # Hole in the log (pruned) → force rebuild
+    if not update_logs or update_logs[0].sequence != last_seq + 1:
+        log(
+            manager, websocket, user, "getUpdates",
+            last_seq=last_seq, current_seq=current_seq, missed_count=gap, status="tooLong",
+            reason="log_hole",
+        )
+        return {
+            "status": "tooLong",
+            "lastSeq": current_seq,
+            "missedCount": gap,
+            "hasMore": False,
+        }
+
+    for log_entry in update_logs:
+        updates = json.loads(log_entry.updates)
         await websocket.send_json({
             "type": "updates",
-            "seq": batch["seq"],
-            "updates": batch["updates"]
+            "seq": log_entry.sequence,
+            "updates": updates,
         })
-    
-    # Update the websocket's last sequence tracking
-    manager.last_seq_by_ws[websocket] = current_seq
-    log(manager, websocket, user, "getUpdates", last_seq=last_seq, current_seq=current_seq, missed_count=len(missed_updates))
-    
+
+    sent_last = update_logs[-1].sequence
+    has_more = sent_last < current_seq
+    manager.last_seq_by_ws[websocket] = sent_last
+    log(
+        manager, websocket, user, "getUpdates",
+        last_seq=last_seq, current_seq=current_seq,
+        missed_count=len(update_logs), has_more=has_more,
+    )
+
     return {
         "status": "ok",
-        "lastSeq": current_seq,
-        "missedCount": len(missed_updates)
+        "lastSeq": sent_last,
+        "missedCount": len(update_logs),
+        "hasMore": has_more,
     }
+
+
+@websocket_handler("ackUpdates", authRequired=True)
+async def ackUpdates(manager: MessaggingSocketManager, websocket: WebSocket, db: Session, user: User, data: dict) -> dict | None:
+    """Client ack after successfully applying updates through lastSeq (per connection/device)."""
+    try:
+        acked = int(data.get("lastSeq", 0) or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "lastSeq must be an integer")
+    if acked < 0:
+        raise HTTPException(400, "lastSeq must be >= 0")
+
+    prev = manager.last_seq_by_ws.get(websocket, 0)
+    manager.last_seq_by_ws[websocket] = max(prev, acked)
+    # Retention prune is age-based only — never drop another device's backlog via this ack.
+    if acked > 0 and acked % 100 == 0:
+        manager.prune_update_log(db, user_id=user.id)
+
+    log(manager, websocket, user, "ackUpdates", last_seq=acked)
+    return {"status": "ok", "lastSeq": manager.last_seq_by_ws[websocket]}
 
 
 @websocket_handler("ping", authRequired=True)
@@ -514,10 +573,24 @@ async def call_screen_share_toggle(manager: MessaggingSocketManager, websocket: 
     return {"status": "ok"}
 
 
+def _parse_positive_user_id(data: dict, field: str = "userId") -> int:
+    """Parse a positive user id from WS payload data; raises 400 on missing/invalid."""
+    raw = data.get(field) if isinstance(data, dict) else None
+    if raw is None or raw == "":
+        raise HTTPException(status_code=400, detail=f"Missing {field}")
+    try:
+        user_id = int(raw)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"Invalid {field}")
+    if user_id <= 0:
+        raise HTTPException(status_code=400, detail=f"Invalid {field}")
+    return user_id
+
+
 @websocket_handler("subscribeStatus", authRequired=True)
 async def subscribeStatus(manager: MessaggingSocketManager, websocket: WebSocket, db: Session, user: User, data: dict) -> dict | None:
     """Subscribe to status updates for a user."""
-    user_id_to_subscribe = int(data["userId"])
+    user_id_to_subscribe = _parse_positive_user_id(data or {})
     manager.ws_subscriptions.setdefault(websocket, set()).add(user_id_to_subscribe)
 
     target_user = db.query(User).filter(User.id == user_id_to_subscribe).first()
@@ -555,9 +628,11 @@ async def subscribeStatus(manager: MessaggingSocketManager, websocket: WebSocket
 @websocket_handler("unsubscribeStatus", authRequired=True)
 async def unsubscribeStatus(manager: MessaggingSocketManager, websocket: WebSocket, db: Session, user: User, data: dict) -> dict | None:
     """Unsubscribe from status updates for a user."""
-    user_id_to_unsubscribe = int(data["userId"])
-    manager.ws_subscriptions[websocket].discard(user_id_to_unsubscribe)
-    
+    user_id_to_unsubscribe = _parse_positive_user_id(data or {})
+    subscriptions = manager.ws_subscriptions.get(websocket)
+    if subscriptions is not None:
+        subscriptions.discard(user_id_to_unsubscribe)
+
     log(manager, websocket, user, "unsubscribeStatus", target_user_id=user_id_to_unsubscribe)
     return {"status": "ok"}
 
