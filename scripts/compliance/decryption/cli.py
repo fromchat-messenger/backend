@@ -177,7 +177,10 @@ class _AuthResult:
 
 def _login(api_base_url: str, username: str, password: str) -> str:
     derived = derive_auth_secret(username, password)
-    resp = http_post_json(f"{api_base_url.rstrip('/')}/login", {"username": username, "password": derived})
+    resp = http_post_json(
+        f"{api_base_url.rstrip('/')}/auth/steps/password",
+        {"username": username, "password": derived},
+    )
     token = resp.get("token") if isinstance(resp, dict) else None
     if not isinstance(token, str) or not token:
         raise RuntimeError("Login did not return a token")

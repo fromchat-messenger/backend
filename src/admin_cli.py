@@ -140,7 +140,7 @@ class AdminCLI:
         password = getpass("Password: ")
         derived_password = derive_auth_secret(username, password)
         payload = {"username": username, "password": derived_password}
-        response = self._request("POST", "login", json=payload, auth=False)
+        response = self._request("POST", "auth/steps/password", json=payload, auth=False)
         body = response.json()
         token = body.get("token")
         if not token:

@@ -3,18 +3,15 @@ from collections import defaultdict, deque
 import logging
 import time
 from pathlib import Path
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status, Request
+from fastapi import APIRouter, Depends, HTTPException, status, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import func, inspect, text
 import uuid
 import secrets
-from user_agents import parse as parse_ua
 
 from ..constants import OWNER_USERNAME, DATA_DIR
 from ..dependencies import get_current_user, get_current_user_allow_suspended, get_db
 from ..models import (
-    LoginRequest,
-    RegisterRequest,
     ChangePasswordRequest,
     ChangeYandexRequest,
     VerifyPasswordRequest,
@@ -24,7 +21,7 @@ from ..models import (
     CryptoBackup,
     DeviceSession,
 )
-from ..utils import create_token, get_password_hash, verify_password, get_client_ip
+from ..utils import get_password_hash, verify_password, get_client_ip
 from ..validation import is_valid_password, is_valid_username, is_valid_display_name
 from ..deleted_user import (
     apply_deleted_user_db_fields,
@@ -214,265 +211,6 @@ def check_username(request: Request, username: str, db: Session = Depends(get_db
     )
     return {"exists": exists}
 
-
-@router.post("/login")
-@rate_limit_per_ip("5/minute")
-def login(request: Request, login_request: LoginRequest, db: Session = Depends(get_db)):
-    username = login_request.username.strip()
-    client_ip = get_client_ip(request)
-    raw_ua = request.headers.get("user-agent")
-    import logging
-    logging.getLogger("uvicorn.error").info("Login attempt start for username=%s ip=%s", username, client_ip)
-
-    user = db.query(User).filter(func.lower(User.username) == username.lower()).first()
-    logging.getLogger("uvicorn.error").info("Queried user from DB for username=%s -> %s", username, "FOUND" if user else "NOT FOUND")
-
-    if not user or not verify_password(login_request.password.strip(), user.password_hash):
-        log_security(
-            "login_failed",
-            severity="warning",
-            username=username,
-            ip=client_ip,
-            reason="invalid_credentials",
-        )
-        identifiers = [f"user:{username}"]
-        if client_ip:
-            identifiers.append(f"ip:{client_ip}")
-
-        suspicious = False
-        for identifier in identifiers:
-            if _record_failed_login(identifier):
-                suspicious = True
-
-        if suspicious:
-            total_failures = {
-                identifier: len(_failed_login_attempts.get(identifier, []))
-                for identifier in identifiers
-            }
-            log_security(
-                "auth_bruteforce_detected",
-                severity="warning",
-                username=username,
-                ip=client_ip,
-                failures=total_failures,
-                window_seconds=_FAILED_ATTEMPT_WINDOW_SECONDS,
-            )
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Too many login attempts. Try again in a few minutes.",
-            )
-        raise HTTPException(
-            status_code=401,
-            detail="Неверное имя пользователя или пароль"
-        )
-
-    # Create device session and embed into JWT
-    raw_ua = request.headers.get("user-agent")
-    device_name = request.headers.get("x-device-name")
-    ua = parse_ua(raw_ua or "")
-    session_id = uuid.uuid4().hex
-
-    device = DeviceSession(
-        user_id=user.id,
-        raw_user_agent=raw_ua,
-        device_name=device_name,
-        device_type=("mobile" if ua.is_mobile else "tablet" if ua.is_tablet else "bot" if ua.is_bot else "desktop"),
-        os_name=(ua.os.family or None),
-        os_version=(ua.os.version_string or None),
-        browser_name=(ua.browser.family or None),
-        browser_version=(ua.browser.version_string or None),
-        brand=(ua.device.brand or None),
-        model=(ua.device.model or None),
-        session_id=session_id,
-        created_at=datetime.now(),
-        last_seen=datetime.now(),
-        revoked=False,
-    )
-    db.add(device)
-    db.commit()
-    logging.getLogger("uvicorn.error").info("Login DB commit complete for user_id=%s", user.id)
-
-    token = create_token(user.id, user.username, session_id)
-
-    identifiers = [f"user:{username}"]
-    if client_ip:
-        identifiers.append(f"ip:{client_ip}")
-    for identifier in identifiers:
-        _reset_failed_logins(identifier)
-
-    log_security(
-        "login_success",
-        username=user.username,
-        user_id=user.id,
-        ip=client_ip,
-        session_id=session_id,
-        device=device.device_type,
-        os=device.os_name,
-        browser=device.browser_name,
-    )
-
-    return {
-        "status": "success",
-        "message": "Login successful",
-        "token": token,
-        "user": convert_user(user, db)
-    }
-
-
-@router.post("/register")
-@rate_limit_per_ip("3/hour")
-def register(
-    request: Request,
-    register_request: RegisterRequest,
-    background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
-):
-    username = register_request.username.strip()
-    display_name = register_request.display_name.strip()
-    password = register_request.password.strip()
-    confirm_password = register_request.confirm_password.strip()
-    client_ip = get_client_ip(request)
-    raw_ua = request.headers.get("user-agent")
-
-    # Determine if owner already exists
-    owner_exists = (
-        db.query(User)
-        .filter(func.lower(User.username) == OWNER_USERNAME.lower())
-        .first()
-        is not None
-    )
-
-    # Validate input
-    if not is_valid_username(username):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Имя пользователя должно быть от 3 до 20 символов и содержать только английские буквы, цифры, дефисы и подчеркивания"
-        )
-    if contains_profanity(username):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Имя пользователя содержит запрещённые слова"
-        )
-
-    if not is_valid_display_name(display_name):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Отображаемое имя должно быть от 1 до 64 символов и не может быть пустым"
-        )
-    if contains_profanity(display_name):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Отображаемое имя содержит запрещённые слова"
-        )
-
-    if not is_valid_password(password):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Пароль должен быть от 5 до 50 символов и не содержать пробелов"
-        )
-
-    if password != confirm_password:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Пароли не совпадают"
-        )
-
-    # Case-insensitive uniqueness; store typed casing as entered.
-    # Note: DB unique=True on username remains case-sensitive; a unique index on
-    # lower(username) would harden this at the schema level (no migration here).
-    existing_user = (
-        db.query(User)
-        .filter(func.lower(User.username) == username.lower())
-        .first()
-    )
-    if existing_user:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Это имя пользователя уже занято"
-        )
-
-    bio_text = (register_request.bio or "").strip() or None
-    if bio_text and len(bio_text) > 500:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Описание должно быть не длиннее 500 символов",
-        )
-    if bio_text and contains_profanity(bio_text):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Описание содержит запрещённые слова",
-        )
-
-    hashed_password = get_password_hash(password)
-    
-    # Set verified=True for the owner (first user to register)
-    is_owner = not owner_exists and username.lower() == OWNER_USERNAME.lower()
-    
-    new_user = User(
-        id=allocate_user_id(db),
-        username=username,
-        display_name=display_name,
-        password_hash=hashed_password,
-        bio=bio_text,
-        verified=is_owner
-    )
-
-    db.add(new_user)
-    db.commit()
-    db.refresh(new_user)
-
-    # Create initial device session
-    raw_ua = request.headers.get("user-agent")
-    device_name = request.headers.get("x-device-name")
-    ua = parse_ua(raw_ua or "")
-    session_id = uuid.uuid4().hex
-    device = DeviceSession(
-        user_id=new_user.id,
-        raw_user_agent=raw_ua,
-        device_name=device_name,
-        device_type=("mobile" if ua.is_mobile else "tablet" if ua.is_tablet else "bot" if ua.is_bot else "desktop"),
-        os_name=(ua.os.family or None),
-        os_version=(ua.os.version_string or None),
-        browser_name=(ua.browser.family or None),
-        browser_version=(ua.browser.version_string or None),
-        brand=(ua.device.brand or None),
-        model=(ua.device.model or None),
-        session_id=session_id,
-        created_at=datetime.now(),
-        last_seen=datetime.now(),
-        revoked=False,
-    )
-    db.add(device)
-    db.commit()
-
-    token = create_token(new_user.id, new_user.username, session_id)
-
-    os_name = ua.os.family or "Unknown OS"
-    if ua.os.version_string:
-        os_name = f"{os_name} {ua.os.version_string}"
-    browser_name = ua.browser.family or "Unknown browser"
-    if ua.browser.version_string:
-        browser_name = f"{browser_name} {ua.browser.version_string}"
-    user_agent_summary = f"{os_name}, {browser_name}"
-
-    log_security(
-        "registration_success",
-        username=new_user.username,
-        display_name=new_user.display_name,
-        user_id=new_user.id,
-        ip=client_ip,
-        user_agent=user_agent_summary,
-        owner=is_owner,
-    )
-
-    background_tasks.add_task(_broadcast_registered_user_count_task)
-
-    return {
-        "status": "success",
-        "message": "Регистрация прошла успешно",
-        "token": token,
-        "user": convert_user(new_user, db)
-    }
 
 @router.get("/crypto/public-key")
 def get_public_key(current_user: User = Depends(get_current_user_allow_suspended), db: Session = Depends(get_db)):

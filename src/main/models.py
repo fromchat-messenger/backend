@@ -212,19 +212,6 @@ class DeviceSession(Base):
     user = relationship("User", lazy="select")
 
 # Pydantic модели
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-
-
-class RegisterRequest(BaseModel):
-    username: str
-    display_name: str
-    password: str
-    confirm_password: str
-    bio: str | None = None
-
-
 class ChangePasswordRequest(BaseModel):
     currentPasswordDerived: str
     newPasswordDerived: str
