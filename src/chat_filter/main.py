@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from typing import List
-
+import censhorspick
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
@@ -51,7 +51,7 @@ def check(body: CheckRequest) -> CheckResponse:
         "allowed" if allowed else "rejected",
         body.text,
     )
-    return CheckResponse(allowed=allowed)
+    return CheckResponse(allowed=allowed and censhorspick.censor_allow(body.text))
 
 
 @app.get("/blocklist")
