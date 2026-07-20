@@ -73,7 +73,7 @@ def contains_profanity(text: str) -> bool:
     except:
         allowed = True
     
-    total = allowed and censhorspick.censor_allow()
+    total = allowed and censhorspick.censor_allow(text)
 
     return not total
 
