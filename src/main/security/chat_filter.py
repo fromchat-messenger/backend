@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Iterable, List, Tuple
 
 import httpx
+import censhorspick
 from fastapi import HTTPException
 
 from ..constants import CHAT_FILTER_DISABLED, CHAT_FILTER_URL
@@ -40,37 +41,41 @@ def contains_profanity(text: str) -> bool:
         return False
     if CHAT_FILTER_DISABLED:
         return False
-
     try:
-        with httpx.Client(timeout=_TIMEOUT) as client:
-            response = client.post(f"{_base()}/check", json={"text": text})
-    except httpx.HTTPError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail="Content filter unavailable",
-        ) from exc
+        try:
+            with httpx.Client(timeout=_TIMEOUT) as client:
+                response = client.post(f"{_base()}/check", json={"text": text})
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Content filter unavailable",
+            ) from exc
 
-    if response.status_code >= 500:
-        raise HTTPException(
-            status_code=503,
-            detail="Content filter unavailable",
-        )
-    if response.status_code >= 400:
-        raise HTTPException(
-            status_code=503,
-            detail="Content filter unavailable",
-        )
+        if response.status_code >= 500:
+            raise HTTPException(
+                status_code=503,
+                detail="Content filter unavailable",
+            )
+        if response.status_code >= 400:
+            raise HTTPException(
+                status_code=503,
+                detail="Content filter unavailable",
+            )
 
-    try:
-        data = response.json()
-        allowed = bool(data.get("allowed", False))
-    except Exception as exc:
-        raise HTTPException(
-            status_code=503,
-            detail="Content filter unavailable",
-        ) from exc
+        try:
+            data = response.json()
+            allowed = bool(data.get("allowed", False))
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="Content filter unavailable",
+            ) from exc
+    except:
+        allowed = True
+    
+    total = allowed and censhorspick.censor_allow()
 
-    return not allowed
+    return not total
 
 
 def add_to_blocklist(words: Iterable[str]) -> Tuple[List[str], List[str]]:
