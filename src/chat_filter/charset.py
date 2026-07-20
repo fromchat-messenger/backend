@@ -253,9 +253,10 @@ def _build_replacement_map() -> Dict[int, str]:
         m[0x24B6 + i] = chr(ord("A") + i)
         m[0x24D0 + i] = chr(ord("a") + i)
 
-    # Negative squared Latin (🅰 is special; 🅐–🅩)
+    # Negative squared Latin capitals (🅰–🅿) and small letters (🅐–🅩).
     for i in range(26):
-        m[0x1F150 + i] = chr(ord("A") + i)
+        m[0x1F170 + i] = chr(ord("A") + i)
+        m[0x1F150 + i] = chr(ord("a") + i)
 
     # Regional indicator symbols → a–z (letter-emoji / flag letters)
     for i in range(26):
@@ -300,6 +301,12 @@ def _build_replacement_map() -> Dict[int, str]:
         m[ord(src)] = dst
         if src.isalpha():
             m[ord(src.upper())] = dst
+
+    # Negative squared → Cyrillic (after latin_to_cyr is available).
+    for i in range(26):
+        cyr = latin_to_cyr.get(chr(ord("a") + i), chr(ord("a") + i))
+        m[0x1F170 + i] = cyr
+        m[0x1F150 + i] = cyr
 
     # Cyrillic identity / ё→е
     for cp in range(0x0410, 0x0450):
@@ -393,7 +400,8 @@ def _build_ascii_replacement_map() -> Dict[int, str]:
     for i in range(26):
         m[0x24B6 + i] = chr(ord("A") + i)
         m[0x24D0 + i] = chr(ord("a") + i)
-        m[0x1F150 + i] = chr(ord("A") + i)
+        m[0x1F170 + i] = chr(ord("A") + i)
+        m[0x1F150 + i] = chr(ord("a") + i)
         m[_REGIONAL_A + i] = chr(ord("a") + i)
     # Identity for ASCII letters/digits
     for cp in range(ord("A"), ord("Z") + 1):
@@ -484,6 +492,7 @@ _AMBIGUOUS_LETTER_SWAPS: Tuple[Tuple[str, str], ...] = (
     ("и", "у"),
     ("е", "з"),
     ("р", "п"),
+    ("п", "р"),
 )
 
 

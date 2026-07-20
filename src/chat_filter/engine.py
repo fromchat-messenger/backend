@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from threading import RLock
-from typing import Set
+from typing import Set, Tuple
 
 from better_profanity import Profanity
 
@@ -105,6 +105,8 @@ _CUSTOM_RU_TERMS: Set[str] = {
 
 _ADULT_TERMS: Set[str] = {
     "порно",
+    "порн",
+    "порню",
     "порнуха",
     "эротика",
     "эротический",
@@ -162,6 +164,12 @@ _WHITELIST: Set[str] = {
 
 _STATIC_TERMS: Set[str] = {t.lower() for t in (_CUSTOM_RU_TERMS | _ADULT_TERMS)}
 
+# Embedded Latin profanity (better_profanity matches whole tokens only).
+_CUSTOM_EN_TERMS: Set[str] = {
+    "porn",
+    "xxx",
+}
+
 _PHRASE_PATTERNS = (
     re.compile(r"max\s*is\s*better", re.IGNORECASE),
     re.compile(r"макс\s*лучше", re.IGNORECASE),
@@ -183,6 +191,23 @@ _PHRASE_PATTERNS = (
     ),
     # Stretched Latin «porn» (Pooornooo-style).
     re.compile(r"p[\s\-_.]*o{2,}[\s\-_.]*r[\s\-_.]*n[\s\-_.]*o+", re.IGNORECASE),
+    # Stretched Cyrillic «порно» (поооорноооо-style).
+    re.compile(
+        r"п[\s\-_.]*о{2,}[\s\-_.]*р[\s\-_.]*н[\s\-_.]*о+",
+        re.IGNORECASE,
+    ),
+    # Latin «porn» / leet (incl. n0rn0 first-letter swap).
+    re.compile(
+        r"(?<![a-z])[pn][\s\-_.]*[o0][\s\-_.]*r[\s\-_.]*n[\s\-_.]*[o0](?![a-z])",
+        re.IGNORECASE,
+    ),
+)
+
+# Matched on whitespace-stripped text to catch «п o р н o» without glued false positives.
+_COMPACT_PHRASE_PATTERNS = (
+    re.compile(r"по{1,}р{1}н{1}о{1,}"),
+    re.compile(r"p[o0]{1,}r{1}n{1}[o0]{1,}"),
+    re.compile(r"p[rр][o0]{1,}n[o0]{1,}"),
 )
 
 _lock = RLock()
@@ -253,18 +278,112 @@ def _subsequence_hit(text: str, term: str) -> bool:
     return False
 
 
-def _ru_terms_hit(normalized: str) -> bool:
+def _token_cyrillic_alternate_forms(text: str) -> Tuple[str, ...]:
+    """Per whitespace token: normalized Cyrillic + leet alternates (for subsequence only)."""
+    forms: Set[str] = set()
+    for token in re.split(r"\s+", text.strip()):
+        if not token:
+            continue
+        token_cyr = map_to_cyrillic_letters(token)
+        if token_cyr:
+            forms.update(cyrillic_alternates(token_cyr))
+    return tuple(forms)
+
+
+def _token_ascii_forms(text: str) -> Tuple[str, ...]:
+    forms: Set[str] = set()
+    for token in re.split(r"\s+", text.strip()):
+        if not token:
+            continue
+        token_ascii = map_to_ascii_letters(token)
+        if token_ascii:
+            forms.add(token_ascii)
+    return tuple(forms)
+
+
+def _concatenated_token_cyrillic(text: str) -> str:
+    parts: list[str] = []
+    for token in re.split(r"\s+", text.strip()):
+        if not token:
+            continue
+        token_cyr = map_to_cyrillic_letters(token)
+        if token_cyr:
+            parts.append(token_cyr)
+    return "".join(parts)
+
+
+def _term_match_forms(text: str, normalized: str) -> Tuple[str, ...]:
+    """Token-wise forms when input has spaces; full glued alternates otherwise."""
+    if re.search(r"\s", text):
+        return _token_cyrillic_alternate_forms(text)
+    return tuple(cyrillic_alternates(normalized))
+
+
+def _exact_token_term_hit(text: str, terms: Set[str]) -> bool:
+    for token in re.split(r"\s+", text.strip()):
+        if not token:
+            continue
+        token_cyr = map_to_cyrillic_letters(token)
+        if not token_cyr:
+            continue
+        for form in cyrillic_alternates(token_cyr):
+            if form in terms:
+                return True
+    return False
+
+
+def _ru_terms_hit(text: str, normalized: str, match_forms: Tuple[str, ...]) -> bool:
     terms = set(_STATIC_TERMS)
     terms |= {w.lower().replace(" ", "") for w in blocklist_store.get_blocklist()}
     terms |= set(_POLITICS_TERMS)
     terms -= _WHITELIST
 
-    for form in cyrillic_alternates(normalized):
+    long_terms = {t for t in terms if len(t) >= 5}
+    # Short stems only as an exact token (avoid «импортный», «опорный», etc.).
+    short_token_terms = {t for t in terms if len(t) == 4 and t in _ADULT_TERMS}
+
+    if short_token_terms and _exact_token_term_hit(text, short_token_terms):
+        return True
+
+    for form in match_forms:
         if form in _WHITELIST:
-            return False
-        if _substring_hit(form, terms):
+            continue
+        if _substring_hit(form, terms - short_token_terms):
             return True
-        for term in terms:
+        for term in terms - short_token_terms:
+            if _subsequence_hit(form, term):
+                return True
+
+    # Spaced bypass: «по рно» → concat «порно»; substring only (no subsequence).
+    if re.search(r"\s", text):
+        concat = _concatenated_token_cyrillic(text)
+        if concat and concat not in _WHITELIST:
+            if _substring_hit(concat, long_terms):
+                return True
+            for form in cyrillic_alternates(concat):
+                if form in _WHITELIST:
+                    continue
+                if _substring_hit(form, long_terms):
+                    return True
+    return False
+
+
+def _ascii_terms_hit(text: str, ascii_form: str) -> bool:
+    if not ascii_form:
+        return False
+    if _english_hit(ascii_form):
+        return True
+
+    en_terms = set(_CUSTOM_EN_TERMS)
+    en_terms |= {w.lower().replace(" ", "") for w in blocklist_store.get_blocklist() if w.isascii()}
+    if re.search(r"\s", text):
+        forms = _token_ascii_forms(text)
+    else:
+        forms = (ascii_form,)
+    for form in forms:
+        if _substring_hit(form, en_terms):
+            return True
+        for term in en_terms:
             if _subsequence_hit(form, term):
                 return True
     return False
@@ -280,8 +399,12 @@ def _english_hit(ascii_text: str) -> bool:
 
 def _phrase_hit(text: str) -> bool:
     lowered = text.lower()
+    compact = re.sub(r"[\s\-_.]+", "", lowered)
     for pattern in _PHRASE_PATTERNS:
         if pattern.search(lowered):
+            return True
+    for pattern in _COMPACT_PHRASE_PATTERNS:
+        if pattern.search(compact):
             return True
     return False
 
@@ -301,11 +424,11 @@ def is_allowed(text: str) -> bool:
     if cyr and cyr in _WHITELIST:
         return True
 
-    if cyr and _ru_terms_hit(cyr):
+    if cyr and _ru_terms_hit(text, cyr, _term_match_forms(text, cyr)):
         return False
 
     ascii_form = map_to_ascii_letters(text)
-    if ascii_form and _english_hit(ascii_form):
+    if ascii_form and _ascii_terms_hit(text, ascii_form):
         return False
 
     # Custom blocklist on ascii glued form too
