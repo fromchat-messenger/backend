@@ -913,6 +913,11 @@ async def _send_message_internal(
 
     # Check for profanity and reject the message instead of censoring
     if raw_content and contains_profanity(raw_content):
+        try:
+            from ..admin.stats_store import increment_messages_blocked
+            increment_messages_blocked()
+        except Exception:
+            pass
         raise HTTPException(
             status_code=422,  # Unprocessable Entity - content validation failed
             detail="Message contains inappropriate content and cannot be sent"
@@ -939,6 +944,11 @@ async def _send_message_internal(
 
     try:
         db.flush()
+        try:
+            from ..admin.analytics_store import note_event
+            note_event("messages")
+        except Exception:
+            pass
 
         # Handle files if provided (normal, not encrypted)
         if files:
@@ -1718,6 +1728,11 @@ async def _edit_message_internal(
 
     # Check for profanity and reject the edit instead of censoring
     if contains_profanity(raw_content):
+        try:
+            from ..admin.stats_store import increment_messages_blocked
+            increment_messages_blocked()
+        except Exception:
+            pass
         raise HTTPException(
             status_code=422,  # Unprocessable Entity - content validation failed
             detail="Message contains inappropriate content and cannot be sent"
@@ -1784,7 +1799,7 @@ async def delete_message(
         raise HTTPException(status_code=404, detail="Message not found")
 
     # Allow owner to delete any message
-    if current_user.username != OWNER_USERNAME and message.user_id != current_user.id:
+    if current_user.id != 1 and message.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="You can only delete your own messages")
 
     original_content = message.content
@@ -2285,6 +2300,19 @@ class MessaggingSocketManager:
                     # Set user association for authenticated connections
                     if user:
                         self.user_by_ws[websocket] = user.id
+                        try:
+                            from ..admin.ip_history import record_ip
+
+                            ip = None
+                            headers = websocket.headers
+                            ip = headers.get("x-real-ip") or headers.get("x-forwarded-for")
+                            if ip:
+                                ip = ip.split(",")[0].strip()
+                            elif websocket.client:
+                                ip = websocket.client.host
+                            record_ip(user.id, ip)
+                        except Exception:
+                            pass
                     
                     # Extract inner data to pass to handler
                     handler_data = data.get("data", {})

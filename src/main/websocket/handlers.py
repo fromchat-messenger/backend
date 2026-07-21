@@ -242,6 +242,11 @@ async def dmSend(manager: MessaggingSocketManager, websocket: WebSocket, db: Ses
     db.add(env)
     db.commit()
     db.refresh(env)
+    try:
+        from ..admin.analytics_store import note_event
+        note_event("messages")
+    except Exception:
+        pass
     
     # Send user-specific WebSocket updates (each user gets only their MEK)
     base_payload = {

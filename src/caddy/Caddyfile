@@ -72,7 +72,7 @@
 	}
 }
 
-fromchat.ru, api.fromchat.ru, git.fromchat.ru, l.fromchat.ru {
+fromchat.ru, api.fromchat.ru, admin.fromchat.ru, git.fromchat.ru, l.fromchat.ru {
 	@site_web host fromchat.ru
 	handle @site_web {
 		reverse_proxy web:80 {
@@ -86,6 +86,34 @@ fromchat.ru, api.fromchat.ru, git.fromchat.ru, l.fromchat.ru {
 			Referrer-Policy "strict-origin-when-cross-origin"
 			Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
 			Permissions-Policy "geolocation=(), microphone=(self), camera=(self)"
+		}
+
+		rate_limit {
+			zone global {
+				match {
+					not path "/.well-known/acme-challenge/*"
+				}
+				key {remote_ip}
+				window 1m
+				burst 20
+				events 500
+			}
+		}
+	}
+
+	@site_admin host admin.fromchat.ru
+	handle @site_admin {
+		reverse_proxy admin:80 {
+			header_up X-Real-IP {remote_host}
+		}
+
+		header {
+			X-XSS-Protection "1; mode=block"
+			X-Content-Type-Options "nosniff"
+			X-Frame-Options "DENY"
+			Referrer-Policy "strict-origin-when-cross-origin"
+			Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+			Permissions-Policy "geolocation=(), microphone=(), camera=()"
 		}
 
 		rate_limit {
@@ -213,7 +241,7 @@ fromchat.ru, api.fromchat.ru, git.fromchat.ru, l.fromchat.ru {
 		}
 
 		@http_cat {
-			expression ({host} == "fromchat.ru" || {host} == "api.fromchat.ru") && {err.status_code} >= 400 && !{path}.startsWith("/.well-known/acme-challenge/")
+			expression ({host} == "fromchat.ru" || {host} == "api.fromchat.ru" || {host} == "admin.fromchat.ru") && {err.status_code} >= 400 && !{path}.startsWith("/.well-known/acme-challenge/")
 		}
 		handle @http_cat {
 			rewrite * /{err.status_code}

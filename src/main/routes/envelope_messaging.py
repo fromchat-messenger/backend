@@ -319,6 +319,11 @@ async def send_encrypted_message(
         db.add(dm_envelope)
         db.commit()
         db.refresh(dm_envelope)
+        try:
+            from ..admin.analytics_store import note_event
+            note_event("messages")
+        except Exception:
+            pass
 
         # Store files encrypted with the SAME MEK as the message.
         # We persist per-file nonce (for AES-GCM) but do not persist per-file wrapped MEKs.
