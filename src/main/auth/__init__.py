@@ -1,1 +1,1 @@
-"""Auth helpers (step APIs, Yandex registration proof)."""
+"""Auth helpers (step APIs, Yandex/VK registration proof)."""

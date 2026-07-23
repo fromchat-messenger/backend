@@ -156,6 +156,24 @@ def _render_security(action: str, fields: Dict[str, Any]) -> List[str]:
         if fields.get("hold_days") is not None:
             lines.append(f"Hold days: {fields['hold_days']}")
         return lines
+    if action == "vk_id_changed":
+        lines = [f"VK ID changed for {_format_user(fields)}"]
+        if fields.get("previous_vk_id"):
+            lines.append(f"Previous VK ID: {fields['previous_vk_id']}")
+        else:
+            lines.append("Previous VK ID: (none)")
+        if fields.get("new_vk_id"):
+            lines.append(f"New VK ID: {fields['new_vk_id']}")
+        if fields.get("ip"):
+            lines.append(f"IP: {fields['ip']}")
+        return lines
+    if action == "vk_id_released":
+        lines = [f"VK ID released after account deletion for {_format_user(fields)}"]
+        if fields.get("previous_vk_id"):
+            lines.append(f"Released VK ID: {fields['previous_vk_id']}")
+        if fields.get("hold_days") is not None:
+            lines.append(f"Hold days: {fields['hold_days']}")
+        return lines
     if action == "logout":
         lines = [f"Logout recorded for {_format_user(fields)}"]
         if fields.get("session_id"):

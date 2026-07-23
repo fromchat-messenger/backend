@@ -49,7 +49,7 @@ def apply_deleted_user_db_fields(user: User) -> None:
     user.last_seen = DELETED_LAST_SEEN
     user.created_at = None
     user.online = False
-    # Keep yandex_id until hold period elapses (see yandex_id_lifecycle).
+    # Keep yandex_id / vk_id until hold period elapses (see *_id_lifecycle).
 
 
 def deleted_user_api_fields(user_id: int) -> dict:

@@ -14,6 +14,7 @@ from ..dependencies import get_current_user, get_current_user_allow_suspended, g
 from ..models import (
     ChangePasswordRequest,
     ChangeYandexRequest,
+    ChangeVkRequest,
     VerifyPasswordRequest,
     DeleteAccountRequest,
     User,
@@ -448,6 +449,71 @@ def change_account_yandex(
         ip=client_ip,
         previous_yandex_id=previous,
         new_yandex_id=new_id,
+    )
+    return {"status": "success", "unchanged": False}
+
+
+@router.get("/account/vk")
+@rate_limit_per_ip("30/minute")
+def get_account_vk(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    from ..auth.vk_oauth import public_vk_oauth_params, vk_is_configured
+
+    if not vk_is_configured():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="VK sign-in is not configured on this server.",
+        )
+    return {
+        "linked": bool(current_user.vk_id),
+        "vk": public_vk_oauth_params(),
+    }
+
+
+@router.post("/account/vk")
+@rate_limit_per_ip("5/hour")
+def change_account_vk(
+    request: Request,
+    body: ChangeVkRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    from ..auth.vk_oauth import verify_registration_proof, vk_is_configured
+
+    if not vk_is_configured():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="VK sign-in is not configured on this server.",
+        )
+    new_id = verify_registration_proof(body.registration_proof)
+    previous = current_user.vk_id
+    if previous == new_id:
+        return {"status": "success", "unchanged": True}
+
+    linked = (
+        db.query(User)
+        .filter(User.vk_id == new_id, User.id != current_user.id)
+        .first()
+    )
+    if linked is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This VK account is already linked to another FromChat user.",
+        )
+
+    current_user.vk_id = new_id
+    db.commit()
+
+    client_ip = get_client_ip(request)
+    log_security(
+        "vk_id_changed",
+        username=current_user.username,
+        user_id=current_user.id,
+        ip=client_ip,
+        previous_vk_id=previous,
+        new_vk_id=new_id,
     )
     return {"status": "success", "unchanged": False}
 

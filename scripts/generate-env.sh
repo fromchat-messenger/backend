@@ -45,24 +45,42 @@ _COMPLIANCE_PRIVATE_B64=""
 _COMPLIANCE_PUBLIC_B64=""
 
 _ENV_TEMPLATE="$(cat <<EOF
+# Cryptography & auth secrets
 $("$VENV_PY" src/main/generate_vapid_keys.py </dev/null)
 JWT_SECRET=$(openssl rand -base64 32 </dev/null | tr -d '\n')
 COMPLIANCE_PUBLIC_KEY=<gen:compliance>
-DEPLOYMENT_SERVER=<set>
+
+# Inter-service credentials
 LIVEKIT_API_KEY=<gen:livekit_key>
 LIVEKIT_API_SECRET=<gen:livekit_secret>
+RELEASES_TOKEN=<set>
 POSTGRES_PASSWORD=$(openssl rand -hex 8 </dev/null)
 MAIN_DB_PASSWORD=$(openssl rand -hex 8 </dev/null)
 MESSAGING_DB_PASSWORD=$(openssl rand -hex 8 </dev/null)
-FILE_STORAGE_DB_PASSWORD=$(openssl rand -hex 8 </dev/null)
-RELEASES_TOKEN=<set>
+FILE_STORAGE_DB_PASSWORD=$(openssl rand -hex 8 </dev/null>
+
+# Deployment
+DEPLOYMENT_SERVER=<set>
+
+# App settings
 MESSAGE_RETENTION_DAYS=180
-YANDEX_OAUTH_REQUIRED=0
+
+# Identity OAuth
+OAUTH_REQUIRED=0
+
+YANDEX_OAUTH_ENABLED=0
 YANDEX_OAUTH_CLIENT_ID=
 YANDEX_OAUTH_CLIENT_SECRET=
 YANDEX_OAUTH_REDIRECT_URI=fromchat://oauth/yandex
 YANDEX_OAUTH_SCOPE=login:email
 YANDEX_ID_HOLD_DAYS=3
+
+VK_OAUTH_ENABLED=0
+VK_OAUTH_CLIENT_ID=
+VK_OAUTH_SERVICE_TOKEN=
+VK_OAUTH_REDIRECT_URI=https://api.fromchat.ru/oauth/vk
+VK_OAUTH_SCOPE=
+VK_ID_HOLD_DAYS=3
 EOF
 )"
 
@@ -249,8 +267,15 @@ EOF
 
 process_line() {
   local line="$1"
-  [[ -z "$line" ]] && return 0
-  [[ "$line" =~ ^[[:space:]]*# ]] && return 0
+  # Preserve blank lines and comment headers in the written .env
+  if [[ -z "$line" ]]; then
+    ENV_LINES+=("")
+    return 0
+  fi
+  if [[ "$line" =~ ^[[:space:]]*# ]]; then
+    ENV_LINES+=("$line")
+    return 0
+  fi
   local key rhs
   key="${line%%=*}"
   rhs="${line#*=}"

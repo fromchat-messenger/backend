@@ -11,6 +11,7 @@ import jwt
 from fastapi import HTTPException, status
 
 from ..constants import JWT_ALGORITHM, JWT_SECRET_KEY
+from .oauth_flags import env_flag
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -24,35 +25,19 @@ YANDEX_SCOPE = (os.getenv("YANDEX_OAUTH_SCOPE") or "login:email").strip()
 REGISTRATION_PROOF_TTL_SECONDS = 15 * 60
 _PROOF_PURPOSE = "yandex_registration"
 
-
-def _env_flag(name: str, default: bool = False) -> bool:
-    raw = (os.getenv(name) or "").strip().lower()
-    if not raw:
-        return default
-    if raw in ("1", "true", "yes", "on"):
-        return True
-    if raw in ("0", "false", "no", "off"):
-        return False
-    raise SystemExit(f"Invalid {name}={os.getenv(name)!r}. Use 1/true or 0/false.")
-
-
 YANDEX_OAUTH_CLIENT_ID = (os.getenv("YANDEX_OAUTH_CLIENT_ID") or "").strip()
 YANDEX_OAUTH_CLIENT_SECRET = (os.getenv("YANDEX_OAUTH_CLIENT_SECRET") or "").strip()
 YANDEX_OAUTH_REDIRECT_URI = (os.getenv("YANDEX_OAUTH_REDIRECT_URI") or "fromchat://oauth/yandex").strip()
-YANDEX_OAUTH_REQUIRED = _env_flag("YANDEX_OAUTH_REQUIRED", default=False)
+YANDEX_OAUTH_ENABLED = env_flag("YANDEX_OAUTH_ENABLED", default=False)
 
-if YANDEX_OAUTH_REQUIRED and (not YANDEX_OAUTH_CLIENT_ID or not YANDEX_OAUTH_CLIENT_SECRET):
+if YANDEX_OAUTH_ENABLED and (not YANDEX_OAUTH_CLIENT_ID or not YANDEX_OAUTH_CLIENT_SECRET):
     raise SystemExit(
-        "YANDEX_OAUTH_REQUIRED=1 but YANDEX_OAUTH_CLIENT_ID / YANDEX_OAUTH_CLIENT_SECRET are missing."
+        "YANDEX_OAUTH_ENABLED=1 but YANDEX_OAUTH_CLIENT_ID / YANDEX_OAUTH_CLIENT_SECRET are missing."
     )
 
 
 def yandex_is_configured() -> bool:
-    return bool(YANDEX_OAUTH_CLIENT_ID and YANDEX_OAUTH_CLIENT_SECRET)
-
-
-def yandex_required_for_register() -> bool:
-    return YANDEX_OAUTH_REQUIRED and yandex_is_configured()
+    return YANDEX_OAUTH_ENABLED
 
 
 def public_yandex_oauth_params() -> dict[str, str]:

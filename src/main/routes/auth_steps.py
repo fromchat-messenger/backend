@@ -11,11 +11,18 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from user_agents import parse as parse_ua
 
+from ..auth.oauth_flags import oauth_required
+from ..auth.vk_oauth import (
+    exchange_code_for_registration_proof as exchange_vk_code_for_registration_proof,
+    public_vk_oauth_params,
+    verify_registration_proof as verify_vk_registration_proof,
+    vk_is_configured,
+)
 from ..auth.yandex_oauth import (
-    exchange_code_for_registration_proof,
+    exchange_code_for_registration_proof as exchange_yandex_code_for_registration_proof,
     public_yandex_oauth_params,
-    verify_registration_proof,
-    yandex_required_for_register,
+    verify_registration_proof as verify_yandex_registration_proof,
+    yandex_is_configured,
 )
 from ..constants import OWNER_USERNAME
 from ..dependencies import get_db
@@ -53,6 +60,13 @@ class YandexExchangeRequest(BaseModel):
     code_verifier: str
 
 
+class VkExchangeRequest(BaseModel):
+    code: str
+    code_verifier: str
+    device_id: str
+    state: str
+
+
 class RegisterConfirmRequest(BaseModel):
     username: str
     password: str
@@ -62,6 +76,11 @@ class RegisterConfirmRequest(BaseModel):
     registration_proof: str | None = None
     yandex_code: str | None = None
     code_verifier: str | None = None
+    vk_registration_proof: str | None = None
+    vk_code: str | None = None
+    vk_code_verifier: str | None = None
+    vk_device_id: str | None = None
+    vk_state: str | None = None
 
 
 def _create_device_session(db: Session, user: User, request: Request) -> str:
@@ -167,17 +186,56 @@ def _handle_failed_login(username: str, client_ip: str | None) -> None:
     )
 
 
-def _resolve_yandex_id_for_register(body: RegisterConfirmRequest) -> str | None:
-    if not yandex_required_for_register():
-        return None
-    if body.registration_proof and body.registration_proof.strip():
-        return verify_registration_proof(body.registration_proof.strip())
-    if body.yandex_code and body.code_verifier:
-        proof = exchange_code_for_registration_proof(body.yandex_code, body.code_verifier)
-        return verify_registration_proof(proof)
+def _resolve_oauth_ids_for_register(body: RegisterConfirmRequest) -> tuple[str | None, str | None]:
+    """Return (yandex_id, vk_id). When OAUTH_REQUIRED, exactly one must be provided."""
+    has_yandex = bool(
+        (body.registration_proof and body.registration_proof.strip())
+        or (body.yandex_code and body.code_verifier)
+    )
+    has_vk = bool(
+        (body.vk_registration_proof and body.vk_registration_proof.strip())
+        or (body.vk_code and body.vk_code_verifier and body.vk_device_id and body.vk_state)
+    )
+
+    if not oauth_required():
+        return None, None
+
+    if has_yandex and has_vk:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Provide verification from either Yandex or VK ID, not both.",
+        )
+
+    if has_yandex:
+        if not yandex_is_configured():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Yandex verification is not available on this server.",
+            )
+        if body.registration_proof and body.registration_proof.strip():
+            return verify_yandex_registration_proof(body.registration_proof.strip()), None
+        proof = exchange_yandex_code_for_registration_proof(body.yandex_code, body.code_verifier)
+        return verify_yandex_registration_proof(proof), None
+
+    if has_vk:
+        if not vk_is_configured():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="VK verification is not available on this server.",
+            )
+        if body.vk_registration_proof and body.vk_registration_proof.strip():
+            return None, verify_vk_registration_proof(body.vk_registration_proof.strip())
+        proof = exchange_vk_code_for_registration_proof(
+            body.vk_code,
+            body.vk_code_verifier,
+            body.vk_device_id,
+            body.vk_state,
+        )
+        return None, verify_vk_registration_proof(proof)
+
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
-        detail="Yandex verification is required to create an account.",
+        detail="Identity verification is required to create an account. Sign in with Yandex or VK ID.",
     )
 
 
@@ -227,12 +285,16 @@ def auth_step_password(
 
     user = db.query(User).filter(func.lower(User.username) == username.lower()).first()
     if user is None:
+        verification_required = oauth_required()
         payload: dict = {
             "status": "needs_register",
-            "yandex_required": yandex_required_for_register(),
+            "verification_required": verification_required,
         }
-        if yandex_required_for_register():
-            payload["yandex"] = public_yandex_oauth_params()
+        if verification_required:
+            if yandex_is_configured():
+                payload["yandex"] = public_yandex_oauth_params()
+            if vk_is_configured():
+                payload["vk"] = public_vk_oauth_params()
         return payload
 
     if not verify_password(password, user.password_hash):
@@ -248,13 +310,36 @@ def auth_yandex_exchange(
     body: YandexExchangeRequest,
     db: Session = Depends(get_db),
 ):
-    proof = exchange_code_for_registration_proof(body.code, body.code_verifier)
-    yandex_id = verify_registration_proof(proof)
+    proof = exchange_yandex_code_for_registration_proof(body.code, body.code_verifier)
+    yandex_id = verify_yandex_registration_proof(proof)
     linked = db.query(User).filter(User.yandex_id == yandex_id).first()
     if linked is not None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="This Yandex account is already linked to another FromChat user.",
+        )
+    return {"registration_proof": proof}
+
+
+@router.post("/auth/vk/exchange")
+@rate_limit_per_ip("10/minute")
+def auth_vk_exchange(
+    request: Request,
+    body: VkExchangeRequest,
+    db: Session = Depends(get_db),
+):
+    proof = exchange_vk_code_for_registration_proof(
+        body.code,
+        body.code_verifier,
+        body.device_id,
+        body.state,
+    )
+    vk_id = verify_vk_registration_proof(proof)
+    linked = db.query(User).filter(User.vk_id == vk_id).first()
+    if linked is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This VK account is already linked to another FromChat user.",
         )
     return {"registration_proof": proof}
 
@@ -329,13 +414,20 @@ def auth_step_register_confirm(
             detail="Описание содержит запрещённые слова",
         )
 
-    yandex_id = _resolve_yandex_id_for_register(body)
+    yandex_id, vk_id = _resolve_oauth_ids_for_register(body)
     if yandex_id is not None:
         linked = db.query(User).filter(User.yandex_id == yandex_id).first()
         if linked is not None:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="This Yandex account is already linked to another FromChat user.",
+            )
+    if vk_id is not None:
+        linked = db.query(User).filter(User.vk_id == vk_id).first()
+        if linked is not None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="This VK account is already linked to another FromChat user.",
             )
 
     is_owner = not owner_exists and username.lower() == OWNER_USERNAME.lower()
@@ -347,6 +439,7 @@ def auth_step_register_confirm(
         bio=bio_text,
         verified=is_owner,
         yandex_id=yandex_id,
+        vk_id=vk_id,
     )
     db.add(new_user)
     try:
@@ -380,6 +473,7 @@ def auth_step_register_confirm(
         user_agent=f"{os_name}, {browser_name}",
         owner=is_owner,
         yandex_linked=bool(yandex_id),
+        vk_linked=bool(vk_id),
     )
     background_tasks.add_task(_broadcast_registered_user_count_task)
 

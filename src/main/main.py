@@ -121,12 +121,30 @@ async def lifespan(app: FastAPI):
         key_lifecycle_task = None
 
     try:
+        from .auth.oauth_flags import assert_oauth_startup
+
+        assert_oauth_startup()
+    except SystemExit:
+        raise
+    except Exception as e:
+        logger.error("OAuth startup validation failed: %s", e)
+        raise SystemExit(str(e)) from e
+
+    try:
         from .yandex_id_lifecycle_task import start_yandex_id_release_task
         yandex_id_task = asyncio.create_task(start_yandex_id_release_task())
         logger.info("Yandex ID release task started")
     except Exception as e:
         logger.error("Failed to start yandex id release task: %s", e)
         yandex_id_task = None
+
+    try:
+        from .vk_id_lifecycle_task import start_vk_id_release_task
+        vk_id_task = asyncio.create_task(start_vk_id_release_task())
+        logger.info("VK ID release task started")
+    except Exception as e:
+        logger.error("Failed to start vk id release task: %s", e)
+        vk_id_task = None
 
     yield
 
@@ -155,6 +173,13 @@ async def lifespan(app: FastAPI):
         yandex_id_task.cancel()
         try:
             await yandex_id_task
+        except asyncio.CancelledError:
+            pass
+
+    if vk_id_task:
+        vk_id_task.cancel()
+        try:
+            await vk_id_task
         except asyncio.CancelledError:
             pass
 

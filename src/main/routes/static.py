@@ -2,15 +2,47 @@
 Static legal documents and expressive icons served from the instance deploy.
 """
 
+from html import escape
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse
 
 router = APIRouter(tags=["static"])
 
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 _ICONS_DIR = _STATIC_DIR / "icons"
+
+# Deep link the HTTPS VK ID callback forwards to (Android WebView / app).
+_VK_OAUTH_DEEP_LINK = "fromchat://oauth/vk"
+
+
+@router.get("/oauth/vk", response_class=HTMLResponse)
+async def vk_oauth_redirect_landing(request: Request) -> HTMLResponse:
+    """
+    Trusted HTTPS redirect URL for VK ID (Web apps require https).
+
+    Forwards to fromchat://oauth/vk with the same query string (meta refresh, no JS).
+    The Android WebView intercepts the HTTPS URL before this page renders.
+    """
+    qs = request.url.query
+    deep_link = _VK_OAUTH_DEEP_LINK
+    if qs:
+        deep_link = f"{deep_link}?{qs}"
+    href = escape(deep_link, quote=True)
+    html = (
+        "<!DOCTYPE html>\n"
+        '<html lang="en">\n'
+        "<head>\n"
+        '<meta charset="utf-8">\n'
+        f'<meta http-equiv="refresh" content="0;url={href}">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        "<title>FromChat</title>\n"
+        "</head>\n"
+        "<body></body>\n"
+        "</html>\n"
+    )
+    return HTMLResponse(content=html, status_code=200)
 
 
 @router.get("/static/PRIVACY.md")
