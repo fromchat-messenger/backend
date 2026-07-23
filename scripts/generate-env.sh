@@ -45,18 +45,27 @@ _COMPLIANCE_PRIVATE_B64=""
 _COMPLIANCE_PUBLIC_B64=""
 
 _ENV_TEMPLATE="$(cat <<EOF
+# Cryptography & auth secrets
 $("$VENV_PY" src/main/generate_vapid_keys.py </dev/null)
 JWT_SECRET=$(openssl rand -base64 32 </dev/null | tr -d '\n')
 COMPLIANCE_PUBLIC_KEY=<gen:compliance>
-DEPLOYMENT_SERVER=<set>
+
+# Inter-service credentials
 LIVEKIT_API_KEY=<gen:livekit_key>
 LIVEKIT_API_SECRET=<gen:livekit_secret>
 POSTGRES_PASSWORD=$(openssl rand -hex 8 </dev/null)
 MAIN_DB_PASSWORD=$(openssl rand -hex 8 </dev/null)
 MESSAGING_DB_PASSWORD=$(openssl rand -hex 8 </dev/null)
 FILE_STORAGE_DB_PASSWORD=$(openssl rand -hex 8 </dev/null)
-RELEASES_TOKEN=<set>
+
+# Settings
 MESSAGE_RETENTION_DAYS=180
+
+# Deployment
+DEPLOYMENT_SERVER=<set>
+RELEASES_TOKEN=<set>
+
+# OAuth
 YANDEX_OAUTH_REQUIRED=0
 YANDEX_OAUTH_CLIENT_ID=
 YANDEX_OAUTH_CLIENT_SECRET=
