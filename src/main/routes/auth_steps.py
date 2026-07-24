@@ -1,6 +1,7 @@
 """Step-based auth endpoints for Android (and future Web migration)."""
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime
 
@@ -11,6 +12,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from user_agents import parse as parse_ua
 
+from ..auth.smartcaptcha import (
+    public_smartcaptcha_params,
+    smartcaptcha_required_for_register,
+    verify_smartcaptcha_token,
+)
 from ..auth.yandex_oauth import (
     exchange_code_for_registration_proof,
     public_yandex_oauth_params,
@@ -37,6 +43,7 @@ from .account import (
 )
 
 router = APIRouter()
+logger = logging.getLogger("uvicorn.error")
 
 
 class UsernameStepRequest(BaseModel):
@@ -62,6 +69,7 @@ class RegisterConfirmRequest(BaseModel):
     registration_proof: str | None = None
     yandex_code: str | None = None
     code_verifier: str | None = None
+    captcha_token: str | None = None
 
 
 def _create_device_session(db: Session, user: User, request: Request) -> str:
@@ -227,12 +235,23 @@ def auth_step_password(
 
     user = db.query(User).filter(func.lower(User.username) == username.lower()).first()
     if user is None:
+        captcha_required = smartcaptcha_required_for_register()
+        yandex_required = yandex_required_for_register()
         payload: dict = {
             "status": "needs_register",
-            "yandex_required": yandex_required_for_register(),
+            "yandex_required": yandex_required,
+            "captcha_required": captcha_required,
         }
-        if yandex_required_for_register():
+        if yandex_required:
             payload["yandex"] = public_yandex_oauth_params()
+        elif captcha_required:
+            payload["captcha"] = public_smartcaptcha_params()
+        logger.info(
+            "auth password needs_register username=%s yandex_required=%s captcha_required=%s",
+            username,
+            yandex_required,
+            captcha_required,
+        )
         return payload
 
     if not verify_password(password, user.password_hash):
@@ -337,6 +356,14 @@ def auth_step_register_confirm(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="This Yandex account is already linked to another FromChat user.",
             )
+    elif smartcaptcha_required_for_register():
+        logger.info(
+            "register confirm requiring SmartCaptcha username=%s ip=%s has_token=%s",
+            username,
+            client_ip,
+            bool((body.captcha_token or "").strip()),
+        )
+        verify_smartcaptcha_token(body.captcha_token or "", client_ip)
 
     is_owner = not owner_exists and username.lower() == OWNER_USERNAME.lower()
     new_user = User(
