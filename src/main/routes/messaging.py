@@ -19,7 +19,7 @@ from ..dependencies import get_current_user, get_current_user_allow_suspended, g
 from .account import convert_user_for_dm_conversation
 from ..deleted_user import deleted_username_for, is_deleted_or_suspended, is_deleted_user, is_suspended_user, public_display_username
 from ..constants import OWNER_USERNAME, DATA_DIR, FILE_STORAGE_SERVICE_URL
-from ..models import Message, SendMessageRequest, EditMessageRequest, User, DMEnvelope, DmConversationPreference, MessageFile, DMFile, Reaction, ReactionRequest, ReactionResponse, DMReaction, DMReactionRequest, DMReactionResponse, UpdateLog, MessageEditHistory, MessageEditHistoryResponse, DeviceSession
+from ..models import Message, SendMessageRequest, EditMessageRequest, User, DMEnvelope, DmConversationPreference, DmReadReceipt, MessageFile, DMFile, Reaction, ReactionRequest, ReactionResponse, DMReaction, DMReactionRequest, DMReactionResponse, UpdateLog, MessageEditHistory, MessageEditHistoryResponse, DeviceSession
 from ..presence_service import presence_service
 from ..push_service import push_service
 from src.shared.public_image_dimensions import (
@@ -452,7 +452,12 @@ def convert_message_for_user(
     return payload
 
 
-def convert_dm_envelope(db: Session, envelope: DMEnvelope, user_id: int | None = None) -> dict:
+def convert_dm_envelope(
+    db: Session,
+    envelope: DMEnvelope,
+    user_id: int | None = None,
+    read_ids: set[int] | None = None,
+) -> dict:
     # Group reactions by emoji
     reactions_dict = {}
     if envelope.reactions:
@@ -514,7 +519,8 @@ def convert_dm_envelope(db: Session, envelope: DMEnvelope, user_id: int | None =
         "verified": sender_verified,
         "verification_status": verification_status,
         "reactions": list(reactions_dict.values()),
-        "files": []
+        "files": [],
+        "isRead": _dm_envelope_is_read_for_viewer(db, envelope, user_id, read_ids),
     }
 
     for f in (envelope.files or []):
@@ -1347,7 +1353,8 @@ async def get_messages(
 
 
 class MarkReadRequest(BaseModel):
-    messageIds: list[int]
+    messageIds: list[int] | None = None
+    markAll: bool = False
 
 
 @router.get("/messages/new")
@@ -1366,15 +1373,28 @@ async def get_new_messages(request: Request, current_user: User = Depends(get_cu
 @rate_limit_per_ip("60/minute")
 async def mark_messages_read(request: Request, read_request: MarkReadRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """
-    Mark specified message IDs as read (set Message.is_read = True).
+    Mark public messages as read. `markAll` clears every unread public message;
+    otherwise only `messageIds` are updated.
     """
-    if not read_request or not isinstance(read_request.messageIds, list) or len(read_request.messageIds) == 0:
+    if not read_request:
         return {"status": "success", "updated": 0}
 
     try:
-        updated_count = db.query(Message).filter(Message.id.in_(read_request.messageIds)).update({Message.is_read: True}, synchronize_session=False)
+        if read_request.markAll:
+            updated_count = db.query(Message).filter(Message.is_read == False).update(
+                {Message.is_read: True},
+                synchronize_session=False,
+            )
+        else:
+            ids = read_request.messageIds if isinstance(read_request.messageIds, list) else []
+            if not ids:
+                return {"status": "success", "updated": 0}
+            updated_count = db.query(Message).filter(Message.id.in_(ids)).update(
+                {Message.is_read: True},
+                synchronize_session=False,
+            )
         db.commit()
-    except Exception as e:
+    except Exception:
         try:
             db.rollback()
         except Exception:
@@ -1394,9 +1414,13 @@ async def dm_fetch(request: Request, since: int | None = None, current_user: Use
         envelopes = envelopes.filter(DMEnvelope.id > since)
     envelopes = envelopes.order_by(DMEnvelope.id.asc()).all()
 
+    read_ids = _inbound_dm_read_ids(db, current_user.id, envelopes)
     return {
         "status": "ok",
-        "messages": [convert_dm_envelope(db, envelope, current_user.id) for envelope in envelopes]
+        "messages": [
+            convert_dm_envelope(db, envelope, current_user.id, read_ids)
+            for envelope in envelopes
+        ],
     }
 
 
@@ -1446,8 +1470,9 @@ async def dm_history(
         around_id=around_id,
     )
 
+    read_ids = _inbound_dm_read_ids(db, current_user.id, rows)
     messages_data = [
-        convert_dm_envelope(db, envelope, current_user.id) for envelope in rows
+        convert_dm_envelope(db, envelope, current_user.id, read_ids) for envelope in rows
     ]
 
     return _message_page_response(
@@ -1481,17 +1506,73 @@ def _get_dm_conversation_preference(
     return pref
 
 
+def _inbound_dm_read_ids(
+    db: Session,
+    user_id: int,
+    envelopes: list[DMEnvelope],
+) -> set[int]:
+    inbound = [
+        envelope
+        for envelope in envelopes
+        if envelope.recipient_id == user_id and envelope.sender_id != user_id
+    ]
+    if not inbound:
+        return set()
+    other_ids = {envelope.sender_id for envelope in inbound}
+    last_read_by_other = {
+        pref.other_user_id: int(pref.last_read_envelope_id)
+        for pref in db.query(DmConversationPreference).filter(
+            DmConversationPreference.user_id == user_id,
+            DmConversationPreference.other_user_id.in_(other_ids),
+        ).all()
+    }
+    read_ids = {
+        envelope.id
+        for envelope in inbound
+        if envelope.id <= last_read_by_other.get(envelope.sender_id, 0)
+    }
+    remaining = [envelope.id for envelope in inbound if envelope.id not in read_ids]
+    if remaining:
+        for (envelope_id,) in db.query(DmReadReceipt.envelope_id).filter(
+            DmReadReceipt.user_id == user_id,
+            DmReadReceipt.envelope_id.in_(remaining),
+        ).all():
+            read_ids.add(envelope_id)
+    return read_ids
+
+
+def _dm_envelope_is_read_for_viewer(
+    db: Session,
+    envelope: DMEnvelope,
+    user_id: int | None,
+    read_ids: set[int] | None = None,
+) -> bool:
+    if user_id is None:
+        return False
+    if envelope.sender_id == user_id:
+        return True
+    if envelope.recipient_id != user_id:
+        return False
+    if read_ids is not None:
+        return envelope.id in read_ids
+    return envelope.id in _inbound_dm_read_ids(db, user_id, [envelope])
+
+
 def _count_dm_unread(
     db: Session,
     user_id: int,
     other_user_id: int,
     last_read_envelope_id: int,
 ) -> int:
-    return db.query(DMEnvelope).filter(
+    return db.query(DMEnvelope).outerjoin(
+        DmReadReceipt,
+        (DmReadReceipt.envelope_id == DMEnvelope.id) & (DmReadReceipt.user_id == user_id),
+    ).filter(
         DMEnvelope.sender_id == other_user_id,
         DMEnvelope.recipient_id == user_id,
         DMEnvelope.id > last_read_envelope_id,
         DMEnvelope.deleted_at.is_(None),
+        DmReadReceipt.envelope_id.is_(None),
     ).count()
 
 
@@ -1568,7 +1649,8 @@ async def get_archived_dm_conversations(request: Request, current_user: User = D
 
 
 class DmMarkReadRequest(BaseModel):
-    upToEnvelopeId: int | None = None
+    messageIds: list[int] | None = None
+    markAll: bool = False
 
 
 def _mark_dm_conversation_read(
@@ -1592,6 +1674,47 @@ def _mark_dm_conversation_read(
             pref.last_read_envelope_id = max(pref.last_read_envelope_id, latest.id)
     db.flush()
     return int(pref.last_read_envelope_id)
+
+
+def _mark_dm_envelopes_read_by_ids(
+    db: Session,
+    user_id: int,
+    other_user_id: int,
+    envelope_ids: list[int],
+) -> list[int]:
+    """Mark only the given inbound envelope ids as read. Does not advance the cursor."""
+    ids = [envelope_id for envelope_id in envelope_ids if isinstance(envelope_id, int) and envelope_id > 0]
+    if not ids:
+        return []
+    envelopes = db.query(DMEnvelope).filter(
+        DMEnvelope.id.in_(ids),
+        DMEnvelope.deleted_at.is_(None),
+        DMEnvelope.sender_id == other_user_id,
+        DMEnvelope.recipient_id == user_id,
+    ).all()
+    if not envelopes:
+        return []
+    existing = {
+        row.envelope_id
+        for row in db.query(DmReadReceipt).filter(
+            DmReadReceipt.user_id == user_id,
+            DmReadReceipt.envelope_id.in_([env.id for env in envelopes]),
+        ).all()
+    }
+    marked: list[int] = []
+    for env in envelopes:
+        marked.append(env.id)
+        if env.id in existing:
+            continue
+        db.add(
+            DmReadReceipt(
+                user_id=user_id,
+                envelope_id=env.id,
+                other_user_id=other_user_id,
+            )
+        )
+    db.flush()
+    return marked
 
 
 class DmArchiveRequest(BaseModel):
@@ -1671,19 +1794,45 @@ async def mark_dm_conversation_read(
     if not has_messages:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    up_to = body.upToEnvelopeId if body is not None else None
-    last_read = _mark_dm_conversation_read(
-        db,
-        current_user.id,
-        other_user_id,
-        up_to_envelope_id=up_to,
-    )
-    db.commit()
+    message_ids = body.messageIds if body is not None else None
+    mark_all = bool(body.markAll) if body is not None else False
+    if mark_all:
+        last_read = _mark_dm_conversation_read(
+            db,
+            current_user.id,
+            other_user_id,
+        )
+        db.commit()
+        return {
+            "status": "success",
+            "otherUserId": other_user_id,
+            "markAll": True,
+            "messageIds": [],
+            "lastReadEnvelopeId": last_read,
+        }
+    if message_ids:
+        marked_ids = _mark_dm_envelopes_read_by_ids(
+            db,
+            current_user.id,
+            other_user_id,
+            message_ids,
+        )
+        db.commit()
+        pref = _get_dm_conversation_preference(db, current_user.id, other_user_id)
+        return {
+            "status": "success",
+            "otherUserId": other_user_id,
+            "markAll": False,
+            "messageIds": marked_ids,
+            "lastReadEnvelopeId": int(pref.last_read_envelope_id),
+        }
 
     return {
         "status": "success",
         "otherUserId": other_user_id,
-        "lastReadEnvelopeId": last_read,
+        "markAll": False,
+        "messageIds": [],
+        "lastReadEnvelopeId": 0,
     }
 
 

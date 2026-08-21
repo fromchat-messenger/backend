@@ -183,6 +183,16 @@ class DmConversationPreference(Base):
     )
 
 
+class DmReadReceipt(Base):
+    """Per-user read receipts for individual DM envelopes (not a cursor)."""
+
+    __tablename__ = "dm_read_receipt"
+
+    user_id = Column(Integer, ForeignKey("user.id"), primary_key=True)
+    envelope_id = Column(Integer, ForeignKey("dm_envelope.id"), primary_key=True)
+    other_user_id = Column(Integer, ForeignKey("user.id"), nullable=False, index=True)
+
+
 # Tracks authenticated device sessions per user
 class DeviceSession(Base):
     __tablename__ = "device_session"

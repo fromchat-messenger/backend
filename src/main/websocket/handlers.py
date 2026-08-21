@@ -12,6 +12,7 @@ from ..routes.messaging import (
     _send_message_internal,
     _edit_message_internal,
     _mark_dm_conversation_read,
+    _mark_dm_envelopes_read_by_ids,
     get_messages,
     edit_message,
     delete_message,
@@ -23,6 +24,7 @@ from ..models import (
     SendMessageRequest,
     EditMessageRequest,
     DMEnvelope,
+    Message,
     ReactionRequest,
     DMReactionRequest,
     UpdateLog,
@@ -423,28 +425,62 @@ async def dmDelete(manager: MessaggingSocketManager, websocket: WebSocket, db: S
 
 @websocket_handler("dmMarkRead", authRequired=True)
 async def dmMarkRead(manager: MessaggingSocketManager, websocket: WebSocket, db: Session, user: User, data: dict) -> dict | None:
-    """Mark DM envelopes up to the given id as read for the current user."""
-    envelope_id = int(data["id"])
-    env: DMEnvelope | None = db.query(DMEnvelope).filter(DMEnvelope.id == envelope_id).first()
+    """Mark the given DM envelope ids as read for the current user."""
+    raw_ids = data.get("messageIds") or data.get("ids")
+    if raw_ids is None and data.get("id") is not None:
+        raw_ids = [data["id"]]
+    envelope_ids: list[int] = []
+    for item in raw_ids or []:
+        try:
+            envelope_id = int(item)
+        except (TypeError, ValueError):
+            continue
+        if envelope_id > 0:
+            envelope_ids.append(envelope_id)
+    if not envelope_ids:
+        raise HTTPException(status_code=400, detail="messageIds required")
+
+    env: DMEnvelope | None = db.query(DMEnvelope).filter(DMEnvelope.id == envelope_ids[0]).first()
     if not env:
         raise HTTPException(status_code=404, detail="DM not found")
     if env.sender_id != user.id and env.recipient_id != user.id:
         raise HTTPException(status_code=403, detail="Not a participant in this conversation")
 
     other_user_id = env.recipient_id if env.sender_id == user.id else env.sender_id
-    last_read = _mark_dm_conversation_read(
+    marked_ids = _mark_dm_envelopes_read_by_ids(
         db,
         user.id,
         other_user_id,
-        up_to_envelope_id=envelope_id,
+        envelope_ids,
     )
     db.commit()
 
-    log(manager, websocket, user, "dmMarkRead", dm_envelope_id=envelope_id, other_user_id=other_user_id)
-    return {"status": "ok", "lastReadEnvelopeId": last_read}
+    log(manager, websocket, user, "dmMarkRead", dm_envelope_ids=marked_ids, other_user_id=other_user_id)
+    return {"status": "ok", "messageIds": marked_ids}
 
-    
-    return {"status": "ok", "id": env_id}
+
+@websocket_handler("dmMarkAllRead", authRequired=True)
+async def dmMarkAllRead(manager: MessaggingSocketManager, websocket: WebSocket, db: Session, user: User, data: dict) -> dict | None:
+    """Mark every inbound DM in a conversation as read for the current user."""
+    other_user_id = int(data["otherUserId"])
+    if other_user_id <= 0 or other_user_id == user.id:
+        raise HTTPException(status_code=400, detail="Invalid user ID")
+    last_read = _mark_dm_conversation_read(db, user.id, other_user_id)
+    db.commit()
+    log(manager, websocket, user, "dmMarkAllRead", other_user_id=other_user_id)
+    return {"status": "ok", "markAll": True, "lastReadEnvelopeId": last_read}
+
+
+@websocket_handler("messagesMarkAllRead", authRequired=True)
+async def messagesMarkAllRead(manager: MessaggingSocketManager, websocket: WebSocket, db: Session, user: User, data: dict) -> dict | None:
+    """Mark every unread public message as read."""
+    updated = db.query(Message).filter(Message.is_read == False).update(
+        {Message.is_read: True},
+        synchronize_session=False,
+    )
+    db.commit()
+    log(manager, websocket, user, "messagesMarkAllRead", updated=int(updated))
+    return {"status": "ok", "markAll": True, "updated": int(updated)}
 
 
 @websocket_handler("deleteMessage", authRequired=True)
