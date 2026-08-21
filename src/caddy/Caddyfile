@@ -224,3 +224,8 @@ fromchat.ru, api.fromchat.ru, git.fromchat.ru, l.fromchat.ru {
 		}
 	}
 }
+
+# Runtime-only snippets (mounted at /etc/caddy/additions). Glob `*` skips
+# dotfiles; an empty directory is fine.
+import additions/*
+

@@ -12,6 +12,7 @@ services:
     volumes:
       - ./data/prod/caddy/data:/data
       - ./data/prod/caddy/config:/config
+      - ./src/caddy/additions:/etc/caddy/additions:ro
     networks:
       - public
     restart: unless-stopped
