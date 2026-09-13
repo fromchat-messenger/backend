@@ -10,4 +10,4 @@ if [[ ! -f .env ]]; then
   exit 1
 fi
 
-exec docker compose --env-file .env -f compose.yml up --build --watch
+exec docker compose --env-file .env up --build --watch

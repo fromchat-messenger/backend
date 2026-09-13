@@ -121,9 +121,9 @@ web_modules/
 .env.production.local
 .env.local
 
-# Firebase service account JSON (backend/firebase-cert.json; bind-mounted in docker-compose)
-firebase-cert.json
-**/firebase-cert.json
+# Local secrets (bind-mounted in compose; keep directory via .gitkeep)
+secrets/
+!secrets/.gitkeep
 firebase-adminsdk.json
 **/firebase-adminsdk.json
 

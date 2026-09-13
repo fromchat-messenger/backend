@@ -10,6 +10,27 @@ class PresenceService:
     def __init__(self) -> None:
         self._connections: dict[int, set[WebSocket]] = {}
         self._last_seen: dict[int, datetime] = {}
+        self._session_connections: dict[str, set[WebSocket]] = {}
+        self._ws_to_session: dict[WebSocket, str] = {}
+
+    def register_session_connection(self, session_id: str, websocket: WebSocket) -> None:
+        """Track a live WebSocket for a device session."""
+        self._ws_to_session[websocket] = session_id
+        self._session_connections.setdefault(session_id, set()).add(websocket)
+
+    def unregister_session_connection(self, websocket: WebSocket) -> None:
+        session_id = self._ws_to_session.pop(websocket, None)
+        if not session_id:
+            return
+        connections = self._session_connections.get(session_id)
+        if not connections:
+            return
+        connections.discard(websocket)
+        if not connections:
+            del self._session_connections[session_id]
+
+    def is_session_online(self, session_id: str) -> bool:
+        return bool(self._session_connections.get(session_id))
 
     def register_connection(self, user_id: int, websocket: WebSocket) -> bool:
         """Track a live connection. Returns True if the user became online."""
@@ -25,6 +46,7 @@ class PresenceService:
             return False, self._last_seen.get(user_id)
 
         connections.discard(websocket)
+        self.unregister_session_connection(websocket)
         if connections:
             return False, None
 

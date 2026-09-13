@@ -1,3 +1,5 @@
+name: fromchat-backend
+
 services:
   backend:
     build:
@@ -28,12 +30,13 @@ services:
       YANDEX_ID_HOLD_DAYS: ${YANDEX_ID_HOLD_DAYS:-3}
       SMARTCAPTCHA_SERVER_KEY: ${SMARTCAPTCHA_SERVER_KEY:-}
       SMARTCAPTCHA_CLIENT_KEY: ${SMARTCAPTCHA_CLIENT_KEY:-}
+      LOGS_DIR: /app/logs
     ports:
       - "8300:8300"
     volumes:
-      - ./data/prod:/app/data
-      - ./data/prod/files:/app/files
-      - ./firebase-cert.json:/app/firebase-cert.json:ro
+      - data:/app/data
+      - logs:/app/logs
+      - ./secrets:/app/secrets:ro
     networks:
       - public
       - services
@@ -79,8 +82,6 @@ services:
       PORT: 8301
       COMPLIANCE_PUBLIC_KEY: ${COMPLIANCE_PUBLIC_KEY}
       MESSAGE_RETENTION_DAYS: ${MESSAGE_RETENTION_DAYS}
-    volumes:
-      - ./data/prod/logs/messaging:/app/logs
     networks:
       - services
     healthcheck:
@@ -115,8 +116,7 @@ services:
       PORT: 8302
       FILES_DIR: /app/files
     volumes:
-      - ./data/prod/files:/app/files
-      - ./data/prod/logs/file_storage:/app/logs
+      - files:/app/files
     networks:
       - services
     healthcheck:
@@ -149,9 +149,7 @@ services:
       PORT: 8305
       DATA_DIR: /data
     volumes:
-      - ./data/prod/chat_filter:/data
-      # One-time migrate: old main DATA_DIR/profanity/blocklist.json → /data/blocklist.json
-      - ./data/prod/profanity:/legacy/profanity:ro
+      - chat-filter:/data
     networks:
       - services
     healthcheck:
@@ -208,7 +206,7 @@ services:
     ports:
       - "127.0.0.1:5432:5432"
     volumes:
-      - ./data/postgres:/var/lib/postgresql/data
+      - postgres:/var/lib/postgresql/data
     networks:
       - services
     healthcheck:
@@ -226,3 +224,14 @@ networks:
     driver: bridge
     internal: true
 
+volumes:
+  postgres:
+    name: fromchat-postgres
+  data:
+    name: fromchat-data
+  files:
+    name: fromchat-files
+  logs:
+    name: fromchat-logs
+  chat-filter:
+    name: fromchat-chat-filter

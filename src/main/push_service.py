@@ -16,8 +16,14 @@ from firebase_admin import messaging as firebase_messaging
 
 logger = logging.getLogger("uvicorn.error")
 
-# backend/firebase-cert.json — fixed path; Docker bind-mounts this file to /app/firebase-cert.json
-_FIREBASE_CERT_PATH = Path(__file__).resolve().parents[2] / "firebase-cert.json"
+def _resolve_firebase_cert_path() -> Path:
+    explicit = os.getenv("FIREBASE_CERT_PATH", "").strip()
+    if explicit:
+        return Path(explicit)
+    return Path(__file__).resolve().parents[2] / "secrets" / "firebase-cert.json"
+
+
+_FIREBASE_CERT_PATH = _resolve_firebase_cert_path()
 _PUBLIC_CHAT_COLLAPSE_KEY = "public_chat"
 
 
@@ -26,7 +32,7 @@ def _load_firebase_service_account_dict(cert_path: Path) -> dict:
     cert_path = cert_path.resolve()
     if not cert_path.is_file():
         raise FileNotFoundError(
-            f"Firebase credentials file missing or not a file: {cert_path} (expected backend/firebase-cert.json)"
+            f"Firebase credentials file missing or not a file: {cert_path} (expected backend/secrets/firebase-cert.json)"
         )
 
     with cert_path.open(encoding="utf-8") as f:
@@ -124,7 +130,7 @@ class PushNotificationService:
     def __init__(self):
         self.vapid_private_key = os.getenv("VAPID_PRIVATE_KEY")
         self.vapid_public_key = os.getenv("VAPID_PUBLIC_KEY")
-        # Firebase Admin is required for main (FCM); cert path is backend/firebase-cert.json.
+        # Firebase Admin enables FCM; optional cert at backend/secrets/firebase-cert.json.
         self.firebase_initialized = False
         try:
             sa_dict = _load_firebase_service_account_dict(_FIREBASE_CERT_PATH)
@@ -133,9 +139,17 @@ class PushNotificationService:
             firebase_admin.initialize_app(cred)
             self.firebase_initialized = True
             logger.info("Firebase Admin SDK initialized (%s)", _FIREBASE_CERT_PATH)
+        except FileNotFoundError:
+            logger.warning(
+                "Firebase credentials not found at %s; FCM push disabled",
+                _FIREBASE_CERT_PATH,
+            )
         except Exception as e:
-            logger.error("Failed to initialize Firebase Admin SDK from %s: %s", _FIREBASE_CERT_PATH, e)
-            raise
+            logger.warning(
+                "Firebase Admin SDK initialization failed (%s); FCM push disabled: %s",
+                _FIREBASE_CERT_PATH,
+                e,
+            )
 
         if (not self.vapid_public_key) or (not self.vapid_private_key):
             raise ValueError("VAPID public or private key is None")

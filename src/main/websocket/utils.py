@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 from types import SimpleNamespace
 from ..dependencies import get_current_user
 from ..models import User
+from ..utils import verify_token
 
 
 def extract_token_from_data(data: dict) -> str | None:
@@ -19,6 +20,20 @@ def extract_token_from_data(data: dict) -> str | None:
     if credentials and isinstance(credentials, dict):
         return credentials.get("credentials")
     return None
+
+
+def extract_session_id_from_data(data: dict) -> str | None:
+    """Extract device session id from WebSocket message credentials."""
+    token = extract_token_from_data(data)
+    if not token:
+        return None
+    payload = verify_token(token)
+    if not payload:
+        return None
+    session_id = payload.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    return session_id
 
 
 def get_current_user_from_token(token: str, db: Session) -> User | None:

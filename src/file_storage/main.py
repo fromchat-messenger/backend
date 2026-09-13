@@ -104,7 +104,7 @@ except ImportError:
 
 # Base storage directories
 # Prefer absolute paths so relative CWD never drops files into repo-root ./files/.
-# Docker compose mounts ./data/prod/files → /app/files for file_storage (and main).
+# Docker compose uses the files volume at /app/files.
 
 
 def _resolve_files_base_dir() -> Path:

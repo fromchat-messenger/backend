@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 
 from ..dependencies import get_current_user, get_db
 from ..models import User, DeviceSession
+from ..presence_service import presence_service
 from ..utils import verify_token
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
@@ -46,6 +47,7 @@ def list_devices(
                 "model": s.model,
                 "created_at": s.created_at.isoformat() if s.created_at else None,
                 "last_seen": s.last_seen.isoformat() if s.last_seen else None,
+                "online": presence_service.is_session_online(s.session_id),
                 "revoked": s.revoked,
                 "current": s.session_id == current_session_id,
             }

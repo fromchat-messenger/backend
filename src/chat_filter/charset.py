@@ -7,6 +7,7 @@ as integer codepoint tuples.
 
 from __future__ import annotations
 
+import re
 from typing import Dict, FrozenSet, Tuple
 
 # Forbiddden emojis
@@ -493,6 +494,10 @@ _AMBIGUOUS_LETTER_SWAPS: Tuple[Tuple[str, str], ...] = (
     ("е", "з"),
     ("р", "п"),
     ("п", "р"),
+    ("я", "а"),
+    ("а", "я"),
+    ("я", "й"),
+    ("й", "я"),
 )
 
 
@@ -520,4 +525,57 @@ def cyrillic_alternates(normalized: str) -> Tuple[str, ...]:
                     trial = form_chars.copy()
                     trial[i] = dst
                     alts.add("".join(trial))
+
+    # «хкя» / «хъуя» style distortions of «хуя» / «хуй».
+    if re.fullmatch(r"х[ъьку]{0,3}[аяй]", normalized):
+        alts.update({"хуя", "хуй", "хуи", "хуе"})
     return tuple(alts)
+
+
+# Hard sign and zero-width chars inserted to break substring checks (e.g. «хъуй»).
+_OBFUSCATION_FILLER_CHARS = frozenset("ъ\u00ad\u200b\u2060")
+
+
+def collapse_repeated_letters(text: str) -> str:
+    """Collapse stretched letters: «ебааать» → «ebat»."""
+    if not text:
+        return text
+    out = [text[0]]
+    for ch in text[1:]:
+        if ch != out[-1]:
+            out.append(ch)
+    return "".join(out)
+
+
+def strip_obfuscation_fillers(text: str) -> str:
+    """Remove hard sign / invisible separators used as bypass padding."""
+    if not text:
+        return text
+    return "".join(ch for ch in text if ch not in _OBFUSCATION_FILLER_CHARS)
+
+
+def cyrillic_match_variants(normalized: str) -> Tuple[str, ...]:
+    """Common obfuscation normalizations for Cyrillic profanity matching."""
+    if not normalized:
+        return ()
+
+    variants: set[str] = {normalized}
+    collapsed = collapse_repeated_letters(normalized)
+    stripped = strip_obfuscation_fillers(normalized)
+    variants.update(
+        {
+            collapsed,
+            stripped,
+            collapse_repeated_letters(stripped),
+            strip_obfuscation_fillers(collapsed),
+        }
+    )
+
+    expanded: set[str] = set()
+    for form in variants:
+        if not form:
+            continue
+        expanded.add(form)
+        if form.endswith("ь"):
+            expanded.add(form[:-1])
+    return tuple(expanded)

@@ -25,6 +25,7 @@ from ..db import get_db
 from ..models import User, DMEnvelope, DMFile, DMEditHistory, EditMessageRequest
 from ..dependencies import get_current_user, get_current_user_allow_suspended
 from ..security.audit import log_security
+from ..security.dm_rate_limit import enforce_dm_send_rate_limit
 from ..service_calls import (
     get_messaging_transport_public_key,
     get_compliance_public_key,
@@ -228,6 +229,8 @@ async def send_encrypted_message(
             "reply_to_id": optional-reply-id
         }
     """
+    enforce_dm_send_rate_limit(current_user.id)
+
     try:
         # Verify recipient exists
         recipient = db.query(User).filter(User.id == request.recipient_id).first()

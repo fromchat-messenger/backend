@@ -39,7 +39,7 @@ from ..verification_service import (
     compute_verification_status,
     get_verified_users_data,
 )
-from ..websocket.utils import authenticate_user
+from ..websocket.utils import authenticate_user, extract_session_id_from_data
 
 from ..models import FcmToken
 from .. import service_calls
@@ -2438,6 +2438,9 @@ class MessaggingSocketManager:
                     # Set user association for authenticated connections
                     if user:
                         self.user_by_ws[websocket] = user.id
+                        session_id = extract_session_id_from_data(data)
+                        if session_id:
+                            presence_service.register_session_connection(session_id, websocket)
                     
                     # Extract inner data to pass to handler
                     handler_data = data.get("data", {})

@@ -4,17 +4,20 @@ from __future__ import annotations
 
 import re
 from threading import RLock
-from typing import Set, Tuple
+from typing import Iterable, Set, Tuple
 
 from better_profanity import Profanity
 
 from . import blocklist as blocklist_store
 from .charset import (
     cyrillic_alternates,
+    cyrillic_match_variants,
     has_disallowed_characters,
     map_to_ascii_letters,
     map_to_cyrillic_letters,
 )
+
+_OBFUSCATION_FILLER_CHARS = frozenset("ъ\u00ad\u200b\u2060")
 
 # все эти плохие слова писал не я.
 # слова не являются моим или чьем-то другим личным мнением.
@@ -203,6 +206,26 @@ _PHRASE_PATTERNS = (
     ),
 )
 
+# Normalized Cyrillic obfuscation: hard-sign padding and stretched vowels.
+_STRETCHED_PROFANITY_PATTERNS = (
+    re.compile(r"х[ъь]*у+[йи]?"),
+    re.compile(r"х[ъь]*[уy]+[йиеё]+"),
+    re.compile(r"х[ъьку]{0,3}[аяй]"),
+    re.compile(r"еб[а]{2,}[тл][ь]?"),
+    re.compile(r"еб[а]+[тл]{1,2}[ь]?"),
+    re.compile(r"б[лl]+[яa@]+[тt]+[ь]?"),
+    re.compile(r"п[иi1]+[зz3]+[дd]+"),
+    re.compile(r"ч[лl][ъь]*[еe][ъь]*[нn][аa]?"),
+    re.compile(r"п[еe][ъь]*[нn][иi][сs][аa]?"),
+)
+
+# Per-token hard-sign insertion bypasses (checked on each word separately).
+_OBFUSCATED_TOKEN_PATTERNS = _STRETCHED_PROFANITY_PATTERNS + (
+    re.compile(r"^х[ъьку]{0,3}[аяй]$"),
+    re.compile(r"^ч[лl][ъь]*[еe][ъь]*[нn][аa]?$"),
+    re.compile(r"^п[еe][ъь]*[нn][иi][сs][аa]?$"),
+)
+
 # Matched on whitespace-stripped text to catch «п o р н o» without glued false positives.
 _COMPACT_PHRASE_PATTERNS = (
     re.compile(r"по{1,}р{1}н{1}о{1,}"),
@@ -238,7 +261,11 @@ def _rebuild_english_dict() -> None:
 
 def _substring_hit(text: str, terms: Set[str]) -> bool:
     for term in terms:
-        if term and term in text:
+        if not term:
+            continue
+        if term in text:
+            return True
+        if term.endswith("ь") and term[:-1] in text:
             return True
     return False
 
@@ -261,7 +288,11 @@ def _subsequence_hit(text: str, term: str) -> bool:
     j = 0
     seq_start = None
     while i < len(text_chars) and j < len(word_chars):
-        if text_chars[i] == word_chars[j]:
+        ch = text_chars[i]
+        if ch in _OBFUSCATION_FILLER_CHARS:
+            i += 1
+            continue
+        if ch == word_chars[j]:
             if seq_start is None:
                 seq_start = i
             j += 1
@@ -278,6 +309,30 @@ def _subsequence_hit(text: str, term: str) -> bool:
     return False
 
 
+def _token_obfuscation_hit(text: str) -> bool:
+    for token in re.split(r"\s+", text.strip()):
+        if not token:
+            continue
+        token_cyr = map_to_cyrillic_letters(token)
+        if not token_cyr:
+            continue
+        for alt in cyrillic_alternates(token_cyr):
+            for variant in cyrillic_match_variants(alt):
+                for pattern in _OBFUSCATED_TOKEN_PATTERNS:
+                    if pattern.fullmatch(variant):
+                        return True
+    return False
+
+
+def _expand_cyrillic_forms(forms: Iterable[str]) -> Tuple[str, ...]:
+    expanded: Set[str] = set()
+    for form in forms:
+        if not form:
+            continue
+        expanded.update(cyrillic_match_variants(form))
+    return tuple(expanded)
+
+
 def _token_cyrillic_alternate_forms(text: str) -> Tuple[str, ...]:
     """Per whitespace token: normalized Cyrillic + leet alternates (for subsequence only)."""
     forms: Set[str] = set()
@@ -286,7 +341,8 @@ def _token_cyrillic_alternate_forms(text: str) -> Tuple[str, ...]:
             continue
         token_cyr = map_to_cyrillic_letters(token)
         if token_cyr:
-            forms.update(cyrillic_alternates(token_cyr))
+            for alt in cyrillic_alternates(token_cyr):
+                forms.update(cyrillic_match_variants(alt))
     return tuple(forms)
 
 
@@ -316,7 +372,7 @@ def _term_match_forms(text: str, normalized: str) -> Tuple[str, ...]:
     """Token-wise forms when input has spaces; full glued alternates otherwise."""
     if re.search(r"\s", text):
         return _token_cyrillic_alternate_forms(text)
-    return tuple(cyrillic_alternates(normalized))
+    return _expand_cyrillic_forms(cyrillic_alternates(normalized))
 
 
 def _exact_token_term_hit(text: str, terms: Set[str]) -> bool:
@@ -327,8 +383,12 @@ def _exact_token_term_hit(text: str, terms: Set[str]) -> bool:
         if not token_cyr:
             continue
         for form in cyrillic_alternates(token_cyr):
-            if form in terms:
-                return True
+            for variant in cyrillic_match_variants(form):
+                if variant in terms:
+                    return True
+                for term in terms:
+                    if term.endswith("ь") and variant == term[:-1]:
+                        return True
     return False
 
 
@@ -358,9 +418,10 @@ def _ru_terms_hit(text: str, normalized: str, match_forms: Tuple[str, ...]) -> b
     if re.search(r"\s", text):
         concat = _concatenated_token_cyrillic(text)
         if concat and concat not in _WHITELIST:
+            concat_forms = _expand_cyrillic_forms(cyrillic_alternates(concat))
             if _substring_hit(concat, long_terms):
                 return True
-            for form in cyrillic_alternates(concat):
+            for form in concat_forms:
                 if form in _WHITELIST:
                     continue
                 if _substring_hit(form, long_terms):
@@ -409,6 +470,15 @@ def _phrase_hit(text: str) -> bool:
     return False
 
 
+def _stretched_profanity_hit(normalized_cyr: str) -> bool:
+    if not normalized_cyr:
+        return False
+    for pattern in _STRETCHED_PROFANITY_PATTERNS:
+        if pattern.search(normalized_cyr):
+            return True
+    return False
+
+
 def is_allowed(text: str) -> bool:
     """Return True if text may be published; False if it should be rejected."""
     if not text:
@@ -420,9 +490,15 @@ def is_allowed(text: str) -> bool:
     if _phrase_hit(text):
         return False
 
+    if _token_obfuscation_hit(text):
+        return False
+
     cyr = map_to_cyrillic_letters(text)
     if cyr and cyr in _WHITELIST:
         return True
+
+    if cyr and _stretched_profanity_hit(cyr):
+        return False
 
     if cyr and _ru_terms_hit(text, cyr, _term_match_forms(text, cyr)):
         return False

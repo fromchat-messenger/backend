@@ -26,8 +26,8 @@ COPY src/shared/ ./src/shared/
 COPY alembic/ ./alembic/
 COPY alembic.ini ./
 
-RUN mkdir -p /app/data /app/data/logs /app/alembic/versions && \
-    chown -R app:app /app/data /app/alembic
+RUN mkdir -p /app/data /app/logs /app/alembic/versions && \
+    chown -R app:app /app/data /app/logs /app/alembic
 
 USER app
 
@@ -43,8 +43,7 @@ FROM base AS messaging
 COPY src/messaging/ ./src/messaging/
 COPY src/shared/ ./src/shared/
 
-RUN mkdir -p /app/logs && \
-    chown -R messaging:messaging /app && \
+RUN chown -R messaging:messaging /app && \
     chmod 700 /app
 
 USER messaging
@@ -61,19 +60,18 @@ FROM base AS file_storage
 COPY src/file_storage/ ./src/file_storage/
 COPY src/shared/ ./src/shared/
 
-RUN mkdir -p /app/files /app/logs && \
+RUN mkdir -p /app/files && \
     chown -R filestorage:filestorage /app && \
     chmod 700 /app
 
-# Start as root so bind-mounted host dirs can be re-owned, then drop to filestorage.
-USER root
+USER filestorage
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD python3 /usr/local/bin/healthcheck.py
 
 EXPOSE ${PORT:-8302}
 
-CMD ["sh", "-c", "chown -R filestorage:filestorage /app/files /app/logs && exec setpriv --reuid=filestorage --regid=filestorage --init-groups -- python -m src.file_storage.main"]
+CMD ["python", "-m", "src.file_storage.main"]
 
 FROM base AS chat_filter
 

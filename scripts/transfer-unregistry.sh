@@ -1,6 +1,6 @@
 #!/bin/bash
 # Transfer unregistry image from local machine to server
-# Usage: ./scripts/transfer:unregistry.sh [server_user@server_host]
+# Usage: ./scripts/transfer-unregistry.sh [server_user@server_host]
 
 set -e
 
@@ -33,5 +33,3 @@ echo "    -p 5000:5000 \\"
 echo "    -v /run/containerd/containerd.sock:/run/containerd/containerd.sock \\"
 echo "    --restart unless-stopped \\"
 echo "    ghcr.io/psviderski/unregistry:0.3.1"
-
-
