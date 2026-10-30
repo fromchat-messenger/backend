@@ -521,6 +521,7 @@ def convert_dm_envelope(
         "reactions": list(reactions_dict.values()),
         "files": [],
         "isRead": _dm_envelope_is_read_for_viewer(db, envelope, user_id, read_ids),
+        "encryption_mode": getattr(envelope, "encryption_mode", None) or "compliance",
     }
 
     for f in (envelope.files or []):
@@ -2216,6 +2217,12 @@ class MessaggingSocketManager:
                 "type": update_type,
                 "otherUserId": data.get("otherUserId"),
                 "archived": data.get("archived"),
+            }
+        elif update_type == "encryptionModeChanged":
+            sig_data = {
+                "type": update_type,
+                "version": data.get("version"),
+                "encryption_mode": data.get("encryption_mode"),
             }
         else:
             # For unknown types, use full data (less efficient but safe)

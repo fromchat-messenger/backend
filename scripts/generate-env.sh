@@ -60,6 +60,7 @@ FILE_STORAGE_DB_PASSWORD=$(openssl rand -hex 8 </dev/null)
 
 # Settings
 MESSAGE_RETENTION_DAYS=180
+ENCRYPTION_MODE=compliance
 
 # Deployment
 DEPLOYMENT_SERVER=<set>

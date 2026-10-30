@@ -191,6 +191,17 @@ def _render_security(action: str, fields: Dict[str, Any]) -> List[str]:
             f"Target: {_format_actor(fields, 'target')}",
             f"Verified: {_yes_no(fields.get('verified'))}",
         ]
+    if action == "admin_encryption_mode_changed":
+        lines = [
+            "Instance encryption mode changed",
+            f"Actor: {_format_actor(fields, 'actor')}",
+            f"Previous mode: {fields.get('previous_mode', 'unknown')}",
+            f"New mode: {fields.get('new_mode', 'unknown')}",
+            f"Policy version: {fields.get('version', 'unknown')}",
+        ]
+        if fields.get("ip"):
+            lines.append(f"IP: {fields['ip']}")
+        return lines
     if action == "self_delete_account":
         return [f"User {_format_user(fields)} deleted their account"]
     if action == "auto_suspension_public_spam":

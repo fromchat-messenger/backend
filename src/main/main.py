@@ -10,7 +10,8 @@ import logging
 from sqlalchemy.orm.exc import DetachedInstanceError
 
 # Import from same directory
-from .routes import account, messaging, profile, public_chat, push, devices, moderation, download, keys, envelope_messaging, livekit, static as static_routes, auth_steps
+from .routes import account, messaging, profile, public_chat, push, devices, moderation, download, keys, envelope_messaging, livekit, static as static_routes, auth_steps, admin_encryption
+from .instance_encryption import ensure_instance_encryption_file
 from .routes.account import get_server_instance_id
 from .models import User
 from .constants import OWNER_USERNAME
@@ -54,6 +55,13 @@ async def lifespan(app: FastAPI):
             logger.info("Database migrations completed successfully")
     except Exception as e:
         logger.error(f"Failed to run database migrations: {e}")
+        raise
+
+    try:
+        ensure_instance_encryption_file()
+        logger.info("Instance encryption policy file is ready")
+    except Exception as e:
+        logger.error(f"Failed to initialize instance encryption policy: {e}")
         raise
 
     try:
@@ -290,6 +298,7 @@ app.add_middleware(
 
 # Routes
 app.include_router(account.router)
+app.include_router(admin_encryption.router)
 app.include_router(auth_steps.router)
 app.include_router(envelope_messaging.router)
 app.include_router(messaging.router)
