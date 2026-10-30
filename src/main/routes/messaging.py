@@ -1203,19 +1203,34 @@ async def push_test(request: Request, current_user: User = Depends(get_current_u
 
 
 MAX_MESSAGE_PAGE_LIMIT = 200
+DEFAULT_MESSAGE_PAGE_LIMIT = 50
 
 
-def _normalize_page_limit(limit: int | None, *, max_limit: int = MAX_MESSAGE_PAGE_LIMIT) -> int | None:
+def _normalize_page_limit(limit: int | None, *, max_limit: int = MAX_MESSAGE_PAGE_LIMIT) -> int:
     if limit is None:
-        return None
+        return DEFAULT_MESSAGE_PAGE_LIMIT
     return max(1, min(limit, max_limit))
+
+
+def _normalize_message_pagination_cursors(
+    before_id: int | None,
+    after_id: int | None,
+    around_id: int | None,
+) -> tuple[int | None, int | None, int | None]:
+    if sum(x is not None for x in (before_id, after_id, around_id)) > 1:
+        if around_id is not None:
+            before_id = None
+            after_id = None
+        elif before_id is not None and after_id is not None:
+            after_id = None
+    return before_id, after_id, around_id
 
 
 def _paginate_rows_by_id(
     query,
     id_column,
     *,
-    limit: int | None = None,
+    limit: int,
     before_id: int | None = None,
     after_id: int | None = None,
     around_id: int | None = None,
@@ -1226,10 +1241,6 @@ def _paginate_rows_by_id(
     Returns (rows, has_more, has_more_before, has_more_after).
     has_more mirrors has_more_before for before/around pages and has_more_after for after pages.
     """
-    if limit is None:
-        rows = query.order_by(id_column.asc()).all()
-        return rows, False, False, False
-
     if around_id is not None:
         anchor = query.filter(id_column == around_id).first()
         if anchor is None:
@@ -1309,27 +1320,18 @@ def _message_page_response(
     }
 
 
-@router.get("/get_messages")
-@rate_limit_per_ip("60/minute")  # Per-IP limit to prevent abuse
-async def get_messages(
-    request: Request,
+def _get_public_messages_page(
+    db: Session,
+    *,
     limit: int | None = None,
     before_id: int | None = None,
     after_id: int | None = None,
     around_id: int | None = None,
-    current_user: User = Depends(get_current_user_allow_suspended),
-    db: Session = Depends(get_db),
-):
-    from ..security.scrape_limit import enforce_get_messages_soft_limit
-
-    enforce_get_messages_soft_limit(current_user.id)
+) -> dict:
     page_limit = _normalize_page_limit(limit)
-    if sum(x is not None for x in (before_id, after_id, around_id)) > 1:
-        if around_id is not None:
-            before_id = None
-            after_id = None
-        elif before_id is not None and after_id is not None:
-            after_id = None
+    before_id, after_id, around_id = _normalize_message_pagination_cursors(
+        before_id, after_id, around_id
+    )
 
     base_query = db.query(Message)
     rows, has_more, has_more_before, has_more_after = _paginate_rows_by_id(
@@ -1352,6 +1354,29 @@ async def get_messages(
     )
 
 
+@router.get("/get_messages")
+@rate_limit_per_ip("60/minute")  # Per-IP limit to prevent abuse
+async def get_messages(
+    request: Request,
+    limit: int | None = None,
+    before_id: int | None = None,
+    after_id: int | None = None,
+    around_id: int | None = None,
+    current_user: User = Depends(get_current_user_allow_suspended),
+    db: Session = Depends(get_db),
+):
+    from ..security.scrape_limit import enforce_get_messages_soft_limit
+
+    enforce_get_messages_soft_limit(current_user.id)
+    return _get_public_messages_page(
+        db,
+        limit=limit,
+        before_id=before_id,
+        after_id=after_id,
+        around_id=around_id,
+    )
+
+
 class MarkReadRequest(BaseModel):
     messageIds: list[int] | None = None
     markAll: bool = False
@@ -1359,14 +1384,35 @@ class MarkReadRequest(BaseModel):
 
 @router.get("/messages/new")
 @rate_limit_per_ip("60/minute")
-async def get_new_messages(request: Request, current_user: User = Depends(get_current_user_allow_suspended), db: Session = Depends(get_db)):
+async def get_new_messages(
+    request: Request,
+    limit: int | None = None,
+    current_user: User = Depends(get_current_user_allow_suspended),
+    db: Session = Depends(get_db),
+):
     """
     Return unread public messages (Message.is_read == False).
     """
-    new_messages = db.query(Message).filter(Message.is_read == False).order_by(Message.timestamp.asc()).all()
+    from ..security.scrape_limit import enforce_messages_new_soft_limit
+
+    enforce_messages_new_soft_limit(current_user.id)
+    page_limit = _normalize_page_limit(limit)
+    probe = (
+        db.query(Message)
+        .filter(Message.is_read == False)
+        .order_by(Message.timestamp.asc())
+        .limit(page_limit + 1)
+        .all()
+    )
+    has_more = len(probe) > page_limit
+    new_messages = probe[:page_limit]
     verified_users_data = get_verified_users_data(db)
     messages_data = [convert_message(msg, verified_users_data) for msg in new_messages]
-    return {"status": "success", "messages": messages_data}
+    return {
+        "status": "success",
+        "messages": messages_data,
+        "has_more": has_more,
+    }
 
 
 @router.post("/messages/read")
@@ -1408,19 +1454,32 @@ async def mark_messages_read(request: Request, read_request: MarkReadRequest, cu
 
 @router.get("/dm/fetch")
 @rate_limit_per_ip("60/minute")  # Per-IP limit to prevent abuse
-async def dm_fetch(request: Request, since: int | None = None, current_user: User = Depends(get_current_user_allow_suspended), db: Session = Depends(get_db)):
+async def dm_fetch(
+    request: Request,
+    since: int | None = None,
+    limit: int | None = None,
+    current_user: User = Depends(get_current_user_allow_suspended),
+    db: Session = Depends(get_db),
+):
+    from ..security.scrape_limit import enforce_dm_fetch_soft_limit
+
+    enforce_dm_fetch_soft_limit(current_user.id)
+    page_limit = _normalize_page_limit(limit)
     envelopes = db.query(DMEnvelope).filter(DMEnvelope.recipient_id == current_user.id)
     if since:
         envelopes = envelopes.filter(DMEnvelope.id > since)
-    envelopes = envelopes.order_by(DMEnvelope.id.asc()).all()
+    probe = envelopes.order_by(DMEnvelope.id.asc()).limit(page_limit + 1).all()
+    has_more = len(probe) > page_limit
+    rows = probe[:page_limit]
 
-    read_ids = _inbound_dm_read_ids(db, current_user.id, envelopes)
+    read_ids = _inbound_dm_read_ids(db, current_user.id, rows)
     return {
         "status": "ok",
         "messages": [
             convert_dm_envelope(db, envelope, current_user.id, read_ids)
-            for envelope in envelopes
+            for envelope in rows
         ],
+        "has_more": has_more,
     }
 
 
@@ -1447,13 +1506,13 @@ async def dm_history(
     if not other_user:
         raise HTTPException(status_code=404, detail="User not found")
 
+    from ..security.scrape_limit import enforce_dm_history_soft_limit
+
+    enforce_dm_history_soft_limit(current_user.id)
     page_limit = _normalize_page_limit(limit)
-    if sum(x is not None for x in (before_id, after_id, around_id)) > 1:
-        if around_id is not None:
-            before_id = None
-            after_id = None
-        elif before_id is not None and after_id is not None:
-            after_id = None
+    before_id, after_id, around_id = _normalize_message_pagination_cursors(
+        before_id, after_id, around_id
+    )
 
     base_query = db.query(DMEnvelope).filter(
         ((DMEnvelope.sender_id == current_user.id) & (DMEnvelope.recipient_id == other_user_id))

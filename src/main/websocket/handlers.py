@@ -13,7 +13,7 @@ from ..routes.messaging import (
     _edit_message_internal,
     _mark_dm_conversation_read,
     _mark_dm_envelopes_read_by_ids,
-    get_messages,
+    _get_public_messages_page,
     edit_message,
     delete_message,
     add_reaction,
@@ -188,8 +188,34 @@ async def ping(manager: MessaggingSocketManager, websocket: WebSocket, db: Sessi
 
 @websocket_handler("getMessages", authRequired=True)
 async def getMessages(manager: MessaggingSocketManager, websocket: WebSocket, db: Session, user: User, data: dict) -> dict | None:
-    """Get all public chat messages."""
-    result = await get_messages(user, db)
+    """Get a paginated page of public chat messages."""
+    from ..security.scrape_limit import enforce_get_messages_soft_limit
+
+    enforce_get_messages_soft_limit(user.id)
+
+    def _optional_int(key: str) -> int | None:
+        if key not in data or data[key] is None:
+            return None
+        return int(data[key])
+
+    limit = _optional_int("limit")
+    before_id = _optional_int("before_id")
+    if before_id is None:
+        before_id = _optional_int("beforeId")
+    after_id = _optional_int("after_id")
+    if after_id is None:
+        after_id = _optional_int("afterId")
+    around_id = _optional_int("around_id")
+    if around_id is None:
+        around_id = _optional_int("aroundId")
+
+    result = _get_public_messages_page(
+        db,
+        limit=limit,
+        before_id=before_id,
+        after_id=after_id,
+        around_id=around_id,
+    )
     log(manager, websocket, user, "getMessages")
     return result
 

@@ -187,7 +187,14 @@ def get_instance_id_public():
 
 
 @router.get("/check_auth")
-def check_auth(current_user: User = Depends(get_current_user)):
+@rate_limit_per_ip("120/minute")
+def check_auth(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    from ..security.scrape_limit import enforce_check_auth_soft_limit
+
+    enforce_check_auth_soft_limit(current_user.id)
     return {
         "authenticated": True,
         "username": current_user.username,
