@@ -11,6 +11,7 @@ Handles:
 import logging
 import json
 import time
+import base64
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -30,13 +31,11 @@ from ..service_calls import (
     get_messaging_transport_public_key,
     get_compliance_public_key,
     process_message_with_files_in_messaging_service,
-    store_encrypted_file,
+    stage_transport_ciphertext_resumable_upload,
     init_resumable_upload_in_storage,
     get_resumable_upload_status_in_storage,
     upload_resumable_chunk_in_storage,
     complete_resumable_upload_in_storage,
-    get_resumable_upload_blob_path_in_storage,
-    store_encrypted_file_from_path,
     delete_resumable_upload_in_storage,
 )
 from .messaging import messagingManager, convert_dm_envelope, convert_dm_envelope_for_user
@@ -256,24 +255,37 @@ async def send_encrypted_message(
                 detail="Failed to retrieve compliance key"
             )
 
-        all_transport_files: list[dict[str, object]] = [
-            {
-                "encrypted_file_data_b64": f.encrypted_file_data_b64,
-                "filename": f.filename,
-                "file_size": f.file_size,
-            }
-            for f in request.files
-        ]
+        allowed_user_ids = [current_user.id, request.recipient_id]
+        staging_upload_ids: list[str] = []
+        all_transport_files: list[dict[str, object]] = []
+
+        for f in request.files:
+            transport_bytes = base64.b64decode(f.encrypted_file_data_b64)
+            upload_id = await stage_transport_ciphertext_resumable_upload(
+                transport_ciphertext=transport_bytes,
+                filename=f.filename,
+                allowed_user_ids=allowed_user_ids,
+                user_id=current_user.id,
+            )
+            staging_upload_ids.append(upload_id)
+            all_transport_files.append(
+                {
+                    "resumable_upload_id": upload_id,
+                    "filename": f.filename,
+                    "file_size": f.file_size,
+                }
+            )
 
         for upload_id in request.uploaded_file_ids:
-            uploaded_payload = await get_resumable_upload_blob_path_in_storage(
-                upload_id, current_user.id
+            upload_status = await get_resumable_upload_status_in_storage(
+                upload_id,
+                current_user.id,
             )
             all_transport_files.append(
                 {
-                    "encrypted_file_path": uploaded_payload["encrypted_file_path"],
-                    "filename": uploaded_payload["filename"],
-                    "file_size": uploaded_payload["file_size"],
+                    "resumable_upload_id": upload_id,
+                    "filename": upload_status.get("filename") or "file",
+                    "file_size": int(upload_status.get("total_size") or 0),
                     "upload_id": upload_id,
                 }
             )
@@ -286,19 +298,14 @@ async def send_encrypted_message(
             sender_public_key_b64=request.sender_public_key_b64,
             recipient_public_key_b64=request.recipient_public_key_b64,
             transport_files=[
-                (
-                    {
-                        "encrypted_file_path": str(f["encrypted_file_path"]),
-                        "filename": str(f.get("filename", "file")),
-                    }
-                    if f.get("encrypted_file_path")
-                    else {
-                        "encrypted_file_data_b64": str(f["encrypted_file_data_b64"]),
-                        "filename": str(f.get("filename", "file")),
-                    }
-                )
+                {
+                    "resumable_upload_id": str(f["resumable_upload_id"]),
+                    "filename": str(f.get("filename", "file")),
+                }
                 for f in all_transport_files
             ],
+            file_access_user_id=current_user.id,
+            recipient_id=request.recipient_id,
         )
 
         logger.info(
@@ -332,27 +339,10 @@ async def send_encrypted_message(
 
             for i, tf in enumerate(all_transport_files):
                 fr = file_results[i]
-                ciphertext_path = fr.get("ciphertext_path")
-                if ciphertext_path:
-                    file_storage_result = await store_encrypted_file_from_path(
-                        source_path=str(ciphertext_path),
-                        filename=str(tf["filename"]),
-                        content_type="application/octet-stream",
-                        sender_id=current_user.id,
-                        recipient_id=request.recipient_id,
-                    )
-                    try:
-                        Path(ciphertext_path).unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                else:
-                    file_storage_result = await store_encrypted_file(
-                        encrypted_file_data_b64=fr["ciphertext"],
-                        filename=str(tf["filename"]),
-                        content_type="application/octet-stream",
-                        sender_id=current_user.id,
-                        recipient_id=request.recipient_id,
-                    )
+                storage = fr.get("storage")
+                if not isinstance(storage, dict) or not storage.get("path"):
+                    raise HTTPException(status_code=500, detail="File storage result missing")
+                file_storage_result = storage
 
                 df = DMFile(
                     message_id=dm_envelope.id,
@@ -365,7 +355,8 @@ async def send_encrypted_message(
                 db.add(df)
             db.commit()
 
-            for upload_id in request.uploaded_file_ids:
+            cleanup_upload_ids = list(request.uploaded_file_ids) + staging_upload_ids
+            for upload_id in cleanup_upload_ids:
                 try:
                     await delete_resumable_upload_in_storage(upload_id, current_user.id)
                 except Exception as cleanup_error:

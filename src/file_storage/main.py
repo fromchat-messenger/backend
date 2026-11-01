@@ -483,25 +483,24 @@ async def get_resumable_upload_status(upload_id: str, request: Request):
     return await get_resumable_upload_status_internal(upload_id, int(user_id_header))
 
 
-async def upload_resumable_chunk_internal(
-    upload_id: str, user_id: int, offset: int, data_b64: str
+async def upload_resumable_chunk_bytes_internal(
+    upload_id: str, user_id: int, offset: int, chunk: bytes
 ) -> dict:
-    """Internal implementation for in-process calls."""
+    """Append raw bytes to a resumable upload session."""
     meta = _read_resumable_meta(upload_id)
     _assert_resumable_access(meta, user_id)
     if meta.get("complete"):
         raise HTTPException(status_code=409, detail="Upload already completed")
     if offset < 0:
         raise HTTPException(status_code=400, detail="offset must be >= 0")
-    if not data_b64:
-        raise HTTPException(status_code=400, detail="data_b64 is required")
+    if not chunk:
+        raise HTTPException(status_code=400, detail="empty chunk")
     expected_offset = int(meta.get("offset", 0))
     if offset != expected_offset:
         raise HTTPException(
             status_code=409,
             detail=f"Offset mismatch. expected={expected_offset} got={offset}",
         )
-    chunk = base64.b64decode(data_b64)
     new_offset = expected_offset + len(chunk)
     if new_offset > int(meta["total_size"]):
         raise HTTPException(status_code=400, detail="Chunk exceeds total_size")
@@ -512,6 +511,16 @@ async def upload_resumable_chunk_internal(
     meta["updated_at"] = time.time()
     _write_resumable_meta(upload_id, meta)
     return {"offset_received": new_offset}
+
+
+async def upload_resumable_chunk_internal(
+    upload_id: str, user_id: int, offset: int, data_b64: str
+) -> dict:
+    """Internal implementation for in-process calls."""
+    if not data_b64:
+        raise HTTPException(status_code=400, detail="data_b64 is required")
+    chunk = base64.b64decode(data_b64)
+    return await upload_resumable_chunk_bytes_internal(upload_id, user_id, offset, chunk)
 
 
 @app.patch("/uploads/resumable/{upload_id}", response_model=None)
@@ -527,11 +536,20 @@ async def upload_resumable_chunk(upload_id: str, request: Request):
     user_id_header = request.headers.get("X-User-ID")
     if not user_id_header:
         raise HTTPException(status_code=401, detail="Missing user authentication")
+    user_id = int(user_id_header)
+    content_type = (request.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+    if content_type == "application/octet-stream":
+        offset_raw = request.headers.get("X-Upload-Offset")
+        if offset_raw is None or not str(offset_raw).strip():
+            raise HTTPException(status_code=400, detail="X-Upload-Offset header is required")
+        offset = int(offset_raw)
+        chunk = await request.body()
+        return await upload_resumable_chunk_bytes_internal(upload_id, user_id, offset, chunk)
     payload = await request.json()
     offset = int(payload.get("offset", -1))
     data_b64 = payload.get("data_b64")
     return await upload_resumable_chunk_internal(
-        upload_id, int(user_id_header), offset, data_b64
+        upload_id, user_id, offset, data_b64
     )
 
 
@@ -709,6 +727,22 @@ async def get_resumable_upload_data(upload_id: str, request: Request):
     if not user_id_header:
         raise HTTPException(status_code=401, detail="Missing user authentication")
     return await get_resumable_upload_data_internal(upload_id, int(user_id_header))
+
+
+@app.get("/uploads/resumable/{upload_id}/data", response_model=None)
+async def get_resumable_upload_data_stream(upload_id: str, request: Request):
+    """Stream completed resumable upload ciphertext (no base64)."""
+    user_id_header = request.headers.get("X-User-ID")
+    if not user_id_header:
+        raise HTTPException(status_code=401, detail="Missing user authentication")
+    meta = _read_resumable_meta(upload_id)
+    _assert_resumable_access(meta, int(user_id_header))
+    if not meta.get("complete"):
+        raise HTTPException(status_code=409, detail="Upload not completed")
+    data_path = _resumable_data_path(upload_id)
+    if not data_path.is_file():
+        raise HTTPException(status_code=404, detail="Upload payload not found")
+    return FileResponse(str(data_path), media_type="application/octet-stream")
 
 
 async def delete_resumable_upload_internal(upload_id: str, user_id: int) -> dict:

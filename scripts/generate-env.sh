@@ -60,6 +60,8 @@ FILE_STORAGE_DB_PASSWORD=$(openssl rand -hex 8 </dev/null)
 
 # Settings
 MESSAGE_RETENTION_DAYS=180
+CORS_ALLOW_LAN=1
+CORS_EXTRA_ORIGINS=
 
 # Deployment
 DEPLOYMENT_SERVER=<set>

@@ -279,9 +279,32 @@ _cors_origins = [
     "http://localhost:8300",
 ]
 
+_extra_cors = (os.getenv("CORS_EXTRA_ORIGINS") or "").strip()
+if _extra_cors:
+    _cors_origins.extend(part.strip() for part in _extra_cors.split(",") if part.strip())
+
+_cors_allow_lan = (os.getenv("CORS_ALLOW_LAN") or "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+# Browsers on other devices (web dev on :8301, direct API hits) need private-LAN origins allowed.
+_lan_origin_regex = (
+    r"https?://("
+    r"localhost|127\.0\.0\.1"
+    r"|192\.168\.\d{1,3}\.\d{1,3}"
+    r"|10\.\d{1,3}\.\d{1,3}\.\d{1,3}"
+    r"|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}"
+    r")(:\d+)?"
+    if _cors_allow_lan
+    else None
+)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
+    allow_origin_regex=_lan_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

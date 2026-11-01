@@ -4,6 +4,7 @@ Helper functions for inter-service communication used by the main service.
 HTTP calls to messaging and file_storage (URLs from constants).
 """
 from typing import Dict, Any
+import base64
 import logging
 import json
 import os
@@ -249,7 +250,9 @@ async def process_message_with_files_in_messaging_service(
     sender_public_key_b64: str,
     recipient_public_key_b64: str,
     transport_files: list[dict[str, str]],
-    timeout: float = 60.0,
+    file_access_user_id: int,
+    recipient_id: int,
+    timeout: float = 120.0,
 ) -> Dict[str, Any]:
     """
     Process an encrypted message and transport-encrypted files using a single MEK.
@@ -273,6 +276,8 @@ async def process_message_with_files_in_messaging_service(
         "sender_public_key_b64": sender_public_key_b64,
         "recipient_public_key_b64": recipient_public_key_b64,
         "files": transport_files,
+        "file_access_user_id": file_access_user_id,
+        "recipient_id": recipient_id,
     }
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -332,6 +337,58 @@ async def get_resumable_upload_status_in_storage(
         r = await client.get(url, headers={"X-User-ID": str(user_id)})
         r.raise_for_status()
         return r.json()
+
+
+async def upload_resumable_chunk_bytes_in_storage(
+    upload_id: str,
+    user_id: int,
+    offset: int,
+    data: bytes,
+    timeout: float = 120.0,
+) -> Dict[str, Any]:
+    file_storage_url = _file_storage_base_url()
+    url = f"{file_storage_url.rstrip('/')}/uploads/resumable/{upload_id}"
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.patch(
+            url,
+            content=data,
+            headers={
+                "X-User-ID": str(user_id),
+                "Content-Type": "application/octet-stream",
+                "X-Upload-Offset": str(offset),
+            },
+        )
+        r.raise_for_status()
+        return r.json()
+
+
+async def stage_transport_ciphertext_resumable_upload(
+    *,
+    transport_ciphertext: bytes,
+    filename: str,
+    allowed_user_ids: list[int],
+    user_id: int,
+    timeout: float = 120.0,
+) -> str:
+    """Store transport-layer ciphertext in file-storage; return upload_id for messaging."""
+    total_size = len(transport_ciphertext)
+    init = await init_resumable_upload_in_storage(
+        filename=filename,
+        total_size=total_size,
+        allowed_user_ids=allowed_user_ids,
+        timeout=timeout,
+    )
+    upload_id = str(init["upload_id"])
+    await upload_resumable_chunk_bytes_in_storage(
+        upload_id,
+        user_id,
+        0,
+        transport_ciphertext,
+        timeout=timeout,
+    )
+    await complete_resumable_upload_in_storage(upload_id, user_id, timeout=timeout)
+    return upload_id
 
 
 async def upload_resumable_chunk_in_storage(

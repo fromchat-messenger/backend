@@ -37,6 +37,10 @@ from .encryption import (
     is_fcae_transport_blob,
     decrypt_fcae_transport_blob_to_file,
 )
+from .file_storage_client import (
+    download_resumable_upload_to_path,
+    upload_encrypted_file_from_path as storage_upload_encrypted_file,
+)
 from .processor import process_encrypted_message, process_encrypted_message_and_files
 
 try:
@@ -214,22 +218,19 @@ class ProcessMessageRequest(BaseModel):
 
 
 class ProcessMessageWithFilesFile(BaseModel):
-    """
-    A single transport-encrypted file blob (base64 of nonce||ciphertext),
-    encrypted with the same ephemeral client key as the message body.
-    """
-    encrypted_file_data_b64: str
+    """Transport ciphertext already stored in file-storage (resumable session)."""
+    resumable_upload_id: str
     filename: str = "file"
 
 
 class ProcessMessageWithFilesRequest(ProcessMessageRequest):
     """
-    Process a transport-encrypted message and a list of transport-encrypted files
+    Process a transport-encrypted message and resumable transport file uploads
     using a single MEK for the whole envelope.
-
-    Each file blob uses the same client_public_key_b64 / X25519 ephemeral pair as the message.
     """
     files: list[ProcessMessageWithFilesFile]
+    file_access_user_id: int
+    recipient_id: int
 
 # ============================================================================
 # Health Checks
@@ -463,6 +464,70 @@ async def process_message_with_files(
                 pass
 
 
+async def _resolve_transport_files_from_storage(
+    files: list[ProcessMessageWithFilesFile],
+    file_access_user_id: int,
+) -> tuple[list[dict[str, str]], list[Path]]:
+    transport_files: list[dict[str, str]] = []
+    download_paths: list[Path] = []
+    for spec in files:
+        tmp = Path(tempfile.mkstemp(prefix="transport-", suffix=".bin")[1])
+        download_paths.append(tmp)
+        await download_resumable_upload_to_path(
+            spec.resumable_upload_id.strip(),
+            file_access_user_id,
+            tmp,
+        )
+        transport_files.append(
+            {
+                "encrypted_file_path": str(tmp.resolve()),
+                "filename": spec.filename,
+            }
+        )
+    return transport_files, download_paths
+
+
+async def _persist_processed_files_to_storage(
+    result: Dict[str, Any],
+    filenames: list[str],
+    sender_id: int,
+    recipient_id: int,
+) -> Dict[str, Any]:
+    allowed_user_ids = [sender_id, recipient_id]
+    files_in = result.get("files") or []
+    persisted: list[dict[str, Any]] = []
+    for index, entry in enumerate(files_in):
+        filename = filenames[index] if index < len(filenames) else "file"
+        nonce = entry.get("nonce")
+        path_raw = entry.get("ciphertext_path")
+        ciphertext_b64 = entry.get("ciphertext")
+        enc_path: Path | None = None
+        if path_raw:
+            enc_path = Path(str(path_raw))
+        elif ciphertext_b64:
+            enc_path = Path(tempfile.mkstemp(prefix="mek-enc-out-", suffix=".bin")[1])
+            enc_path.write_bytes(base64.b64decode(str(ciphertext_b64), **_B64_DECODE_KW))
+        if enc_path is None or not enc_path.is_file():
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Missing encrypted file output from processor",
+            )
+        try:
+            stored = await storage_upload_encrypted_file(
+                enc_path,
+                filename,
+                allowed_user_ids,
+            )
+        finally:
+            try:
+                enc_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        persisted.append({"nonce": nonce, "storage": stored})
+    result["files"] = persisted
+    return result
+
+
 @app.post("/process-with-files", response_model=None)
 async def process_message_with_files_http(request: ProcessMessageWithFilesRequest):
     """
@@ -473,12 +538,13 @@ async def process_message_with_files_http(request: ProcessMessageWithFilesReques
     - One MEK is generated and used to encrypt message + all files
     - MEK is wrapped for compliance, sender, and recipient (stored on DM envelope)
     """
+    transport_download_paths: list[Path] = []
     try:
-        transport_files = [
-            {"encrypted_file_data_b64": f.encrypted_file_data_b64, "filename": f.filename}
-            for f in request.files
-        ]
-        return await process_message_with_files(
+        transport_files, transport_download_paths = await _resolve_transport_files_from_storage(
+            request.files,
+            request.file_access_user_id,
+        )
+        result = await process_message_with_files(
             client_public_key_b64=request.client_public_key_b64,
             transport_nonce_b64=request.transport_nonce_b64,
             transport_ciphertext_b64=request.transport_ciphertext_b64,
@@ -486,6 +552,12 @@ async def process_message_with_files_http(request: ProcessMessageWithFilesReques
             sender_public_key_b64=request.sender_public_key_b64,
             recipient_public_key_b64=request.recipient_public_key_b64,
             transport_files=transport_files,
+        )
+        return await _persist_processed_files_to_storage(
+            result,
+            filenames=[f.filename for f in request.files],
+            sender_id=request.file_access_user_id,
+            recipient_id=request.recipient_id,
         )
     except CryptoError as e:
         logger.warning("process-with-files: transport CryptoError: %s", e)
@@ -496,9 +568,17 @@ async def process_message_with_files_http(request: ProcessMessageWithFilesReques
                 "key as when file ciphertext was produced."
             ),
         ) from e
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("Failed to process message with files: %s", e)
         raise
+    finally:
+        for path in transport_download_paths:
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     import uvicorn

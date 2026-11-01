@@ -31,8 +31,10 @@ services:
       SMARTCAPTCHA_SERVER_KEY: ${SMARTCAPTCHA_SERVER_KEY:-}
       SMARTCAPTCHA_CLIENT_KEY: ${SMARTCAPTCHA_CLIENT_KEY:-}
       LOGS_DIR: /app/logs
+      CORS_ALLOW_LAN: ${CORS_ALLOW_LAN:-1}
+      CORS_EXTRA_ORIGINS: ${CORS_EXTRA_ORIGINS:-}
     ports:
-      - "8300:8300"
+      - "0.0.0.0:8300:8300"
     volumes:
       - data:/app/data
       - logs:/app/logs
@@ -82,6 +84,7 @@ services:
       PORT: 8301
       COMPLIANCE_PUBLIC_KEY: ${COMPLIANCE_PUBLIC_KEY}
       MESSAGE_RETENTION_DAYS: ${MESSAGE_RETENTION_DAYS}
+      FILE_STORAGE_SERVICE_URL: http://file_storage:8302
     networks:
       - services
     healthcheck:
