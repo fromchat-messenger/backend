@@ -159,13 +159,17 @@ def _parse_message_ids(raw: str) -> List[int]:
 
 
 def _build_api_base(server: str, *, https: bool) -> str:
+    override = os.environ.get("FROMCHAT_API_BASE", "").strip()
+    if override:
+        return override.rstrip("/")
     s = (server or "").strip()
     if s.startswith("http://"):
         s = s[len("http://") :]
     if s.startswith("https://"):
         s = s[len("https://") :]
     scheme = "https" if https else "http"
-    return f"{scheme}://{s}/api"
+    # Main API (port 8300) serves routes at root; legacy web proxy used /api prefix.
+    return f"{scheme}://{s}"
 
 
 @dataclass(frozen=True)
