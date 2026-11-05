@@ -24,6 +24,7 @@ VALID_ENCRYPTION_MODES: frozenset[str] = frozenset({"e2ee", "compliance"})
 
 _INSTANCE_ENCRYPTION_FILE = DATA_DIR / "instance_encryption.json"
 ENV_ENCRYPTION_MODE = "ENCRYPTION_MODE"
+INSTANCE_API_PROTOCOL = "1"
 
 
 @dataclass(frozen=True)
@@ -109,6 +110,7 @@ def build_instance_info_payload(instance_id: str) -> dict:
     policy = read_instance_encryption_policy()
     return {
         "instance_id": instance_id,
+        "protocol": INSTANCE_API_PROTOCOL,
         "encryption_mode": policy.mode,
         "encryption_mode_changed_at": policy.changed_at,
         "encryption_mode_version": policy.version,

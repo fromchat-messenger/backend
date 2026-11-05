@@ -53,6 +53,7 @@ def _compliance_mode_allowed() -> bool:
 async def patch_encryption_mode(
     body: PatchEncryptionModeRequest,
     request: Request,
+    broadcast: bool = True,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -90,12 +91,13 @@ async def patch_encryption_mode(
         "changed_at": policy.changed_at,
         "version": policy.version,
     }
-    try:
-        await messagingManager.broadcast(
-            {"type": "encryptionModeChanged", "data": ws_payload},
-            db,
-        )
-    except Exception as exc:
-        logger.error("Failed to broadcast encryptionModeChanged: %s", exc)
+    if broadcast:
+        try:
+            await messagingManager.broadcast(
+                {"type": "encryptionModeChanged", "data": ws_payload},
+                db,
+            )
+        except Exception as exc:
+            logger.error("Failed to broadcast encryptionModeChanged: %s", exc)
 
     return build_instance_info_payload(get_server_instance_id())
