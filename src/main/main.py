@@ -28,6 +28,8 @@ logger = logging.getLogger("uvicorn.error")
 async def lifespan(app: FastAPI):
     cleanup_task = None
     key_lifecycle_task = None
+    yandex_id_task = None
+    incognito_expiry_task = None
 
     # Startup - run migration in subprocess to avoid logging interference
     try:
@@ -128,6 +130,14 @@ async def lifespan(app: FastAPI):
         logger.error("Failed to start yandex id release task: %s", e)
         yandex_id_task = None
 
+    try:
+        from .device_session_lifecycle import start_incognito_session_expiry_task
+        incognito_expiry_task = asyncio.create_task(start_incognito_session_expiry_task())
+        logger.info("Incognito session expiry task started")
+    except Exception as e:
+        logger.error("Failed to start incognito session expiry task: %s", e)
+        incognito_expiry_task = None
+
     yield
 
     # Shutdown — stop background tasks and force-close WebSockets so Ctrl+C / SIGTERM exits.
@@ -155,6 +165,13 @@ async def lifespan(app: FastAPI):
         yandex_id_task.cancel()
         try:
             await yandex_id_task
+        except asyncio.CancelledError:
+            pass
+
+    if incognito_expiry_task:
+        incognito_expiry_task.cancel()
+        try:
+            await incognito_expiry_task
         except asyncio.CancelledError:
             pass
 

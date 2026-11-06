@@ -32,6 +32,9 @@ class PresenceService:
     def is_session_online(self, session_id: str) -> bool:
         return bool(self._session_connections.get(session_id))
 
+    def websockets_for_session(self, session_id: str) -> set[WebSocket]:
+        return set(self._session_connections.get(session_id, set()))
+
     def register_connection(self, user_id: int, websocket: WebSocket) -> bool:
         """Track a live connection. Returns True if the user became online."""
         connections = self._connections.setdefault(user_id, set())

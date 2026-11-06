@@ -216,6 +216,10 @@ class DeviceSession(Base):
     # Session identity embedded into JWTs
     session_id = Column(String(64), unique=True, nullable=False, index=True)
 
+    # standard | incognito — incognito sessions have a hard expires_at (12h)
+    session_kind = Column(String(32), nullable=False, default="standard", index=True)
+    expires_at = Column(DateTime, nullable=True, index=True)
+
     # Lifecycle
     created_at = Column(DateTime, default=datetime.now)
     last_seen = Column(DateTime, default=datetime.now)

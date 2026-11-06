@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from pydantic import BaseModel
@@ -23,7 +23,13 @@ from ..auth.yandex_oauth import (
     verify_registration_proof,
     yandex_required_for_register,
 )
-from ..constants import OWNER_USERNAME
+from ..constants import (
+    INCOGNITO_REQUEST_HEADER,
+    INCOGNITO_SESSION_TTL_HOURS,
+    OWNER_USERNAME,
+    SESSION_KIND_INCOGNITO,
+    SESSION_KIND_STANDARD,
+)
 from ..dependencies import get_db
 from ..models import DeviceSession, User
 from ..security.audit import log_security
@@ -72,11 +78,18 @@ class RegisterConfirmRequest(BaseModel):
     captcha_token: str | None = None
 
 
+def _request_wants_incognito_session(request: Request) -> bool:
+    raw = (request.headers.get(INCOGNITO_REQUEST_HEADER) or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 def _create_device_session(db: Session, user: User, request: Request) -> str:
     raw_ua = request.headers.get("user-agent")
     device_name = request.headers.get("x-device-name")
     ua = parse_ua(raw_ua or "")
     session_id = uuid.uuid4().hex
+    now = datetime.now()
+    incognito = _request_wants_incognito_session(request)
     device = DeviceSession(
         user_id=user.id,
         raw_user_agent=raw_ua,
@@ -97,8 +110,10 @@ def _create_device_session(db: Session, user: User, request: Request) -> str:
         brand=(ua.device.brand or None),
         model=(ua.device.model or None),
         session_id=session_id,
-        created_at=datetime.now(),
-        last_seen=datetime.now(),
+        session_kind=SESSION_KIND_INCOGNITO if incognito else SESSION_KIND_STANDARD,
+        expires_at=(now + timedelta(hours=INCOGNITO_SESSION_TTL_HOURS)) if incognito else None,
+        created_at=now,
+        last_seen=now,
         revoked=False,
     )
     db.add(device)
@@ -126,11 +141,14 @@ def _login_success_payload(db: Session, user: User, request: Request) -> dict:
         ip=client_ip,
         os=ua.os.family,
         browser=ua.browser.family,
+        incognito=_request_wants_incognito_session(request),
+        session_id=session_id,
     )
     return {
         "status": "success",
         "message": "Login successful",
         "token": token,
+        "session_id": session_id,
         "user": convert_user(user, db),
     }
 

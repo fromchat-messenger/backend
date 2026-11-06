@@ -28,6 +28,11 @@ if not DATABASE_URL.startswith("postgresql"):
 JWT_ALGORITHM = "HS256"
 TOKEN_INACTIVITY_EXPIRE_HOURS = 30 * 24
 MAX_TOKEN_LIFETIME_HOURS = 365 * 24
+# Absolute lifetime for device sessions created while the client is in incognito mode.
+INCOGNITO_SESSION_TTL_HOURS = 12
+SESSION_KIND_STANDARD = "standard"
+SESSION_KIND_INCOGNITO = "incognito"
+INCOGNITO_REQUEST_HEADER = "X-FromChat-Incognito"
 OWNER_USERNAME = "denis0001-dev"
 JWT_SECRET_KEY = os.getenv("JWT_SECRET")
 

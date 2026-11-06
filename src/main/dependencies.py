@@ -89,6 +89,21 @@ def _get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    # Absolute expiry (incognito sessions): hard cutoff, not extended by activity.
+    if device_session.expires_at is not None and device_session.expires_at <= datetime.now():
+        device_session.revoked = True
+        db.commit()
+        logger.info(
+            "get_current_user: session expired (absolute) for user_id=%s session_id=%s",
+            user.id,
+            session_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session expired",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     # Check if session has been inactive for too long (sliding expiration)
     from .constants import TOKEN_INACTIVITY_EXPIRE_HOURS
     inactivity_threshold = datetime.now() - timedelta(hours=TOKEN_INACTIVITY_EXPIRE_HOURS)

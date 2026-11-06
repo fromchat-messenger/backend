@@ -2188,6 +2188,8 @@ class MessaggingSocketManager:
         self._ephemeral_update_types = {
             "typing", "stopTyping", "dmTyping", "stopDmTyping", "statusUpdate",
             "registeredUserCount",
+            # Live notify only — revoked sessions cannot fetch durable logs anyway.
+            "session_ended",
         }
         self.get_updates_too_long_threshold = 500
         self.get_updates_chunk_size = 50

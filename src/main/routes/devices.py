@@ -1,8 +1,10 @@
+import asyncio
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from ..dependencies import get_current_user, get_db
+from ..device_session_lifecycle import notify_sessions_ended
 from ..models import User, DeviceSession
 from ..presence_service import presence_service
 from ..utils import verify_token
@@ -18,6 +20,16 @@ def _get_current_session_id(credentials: HTTPAuthorizationCredentials) -> str:
     if not payload or "session_id" not in payload:
         raise HTTPException(status_code=401, detail="Invalid session")
     return payload["session_id"]
+
+
+def _schedule_session_ended(revoked: list[tuple[int, str]], reason: str) -> None:
+    if not revoked:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    loop.create_task(notify_sessions_ended(revoked, reason=reason))
 
 
 @router.get("")
@@ -37,6 +49,7 @@ def list_devices(
         "devices": [
             {
                 "session_id": s.session_id,
+                "session_kind": getattr(s, "session_kind", None) or "standard",
                 "device_type": s.device_type,
                 "device_name": s.device_name,
                 "os_name": s.os_name,
@@ -47,6 +60,7 @@ def list_devices(
                 "model": s.model,
                 "created_at": s.created_at.isoformat() if s.created_at else None,
                 "last_seen": s.last_seen.isoformat() if s.last_seen else None,
+                "expires_at": s.expires_at.isoformat() if getattr(s, "expires_at", None) else None,
                 "online": presence_service.is_session_online(s.session_id),
                 "revoked": s.revoked,
                 "current": s.session_id == current_session_id,
@@ -72,8 +86,11 @@ def revoke_device(
     )
     if not s:
         raise HTTPException(status_code=404, detail="Device session not found")
+    already = s.revoked
     s.revoked = True
     db.commit()
+    if not already:
+        _schedule_session_ended([(current_user.id, session_id)], reason="revoked")
     return {"status": "success"}
 
 
@@ -84,11 +101,20 @@ def logout_all_except_current(
     db: Session = Depends(get_db)
 ):
     current_session_id = _get_current_session_id(credentials)
-    db.query(DeviceSession).filter(
-        DeviceSession.user_id == current_user.id,
-        DeviceSession.session_id != current_session_id,
-    ).update({DeviceSession.revoked: True})
+    others = (
+        db.query(DeviceSession)
+        .filter(
+            DeviceSession.user_id == current_user.id,
+            DeviceSession.session_id != current_session_id,
+            DeviceSession.revoked.is_(False),
+        )
+        .all()
+    )
+    revoked = [(current_user.id, s.session_id) for s in others]
+    for s in others:
+        s.revoked = True
     db.commit()
+    _schedule_session_ended(revoked, reason="revoked")
     return {"status": "success"}
 
 

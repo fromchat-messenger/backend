@@ -376,11 +376,28 @@ def change_password(
         current_session_id = getattr(request.state, "session_id", None)
         if not current_session_id:
             raise HTTPException(status_code=401, detail="Invalid session")
-        db.query(DeviceSession).filter(
-            DeviceSession.user_id == current_user.id,
-            DeviceSession.session_id != current_session_id,
-        ).update({DeviceSession.revoked: True}, synchronize_session=False)
+        others = (
+            db.query(DeviceSession)
+            .filter(
+                DeviceSession.user_id == current_user.id,
+                DeviceSession.session_id != current_session_id,
+                DeviceSession.revoked.is_(False),
+            )
+            .all()
+        )
+        revoked = [(current_user.id, s.session_id) for s in others]
+        for s in others:
+            s.revoked = True
         db.commit()
+        if revoked:
+            try:
+                import asyncio
+                from ..device_session_lifecycle import notify_sessions_ended
+                asyncio.get_running_loop().create_task(
+                    notify_sessions_ended(revoked, reason="revoked")
+                )
+            except RuntimeError:
+                pass
 
     client_ip = get_client_ip(request)
     log_security(
