@@ -33,6 +33,12 @@ from ..routes.profile import build_profile_update_payload
 from ..deleted_user import public_display_username
 from ..presence_service import presence_service
 from ..security.audit import log_access, log_dm
+from ..dm_encryption_guards import (
+    DmWritePath,
+    require_edit_path_matches_message,
+    validate_dm_write_against_policy,
+    validate_e2ee_envelope_fields,
+)
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -246,10 +252,30 @@ async def dmSend(manager: MessaggingSocketManager, websocket: WebSocket, db: Ses
         raise HTTPException(status_code=403, detail="Account deleted")
 
     payload = data
-    required = ["recipientId", "iv_b64", "ciphertext_b64", "wrapped_mek_b64"]
+    ws_body = {
+        "encryption_mode": payload.get("encryption_mode") or payload.get("encryptionMode"),
+        "encryption_mode_version": payload.get("encryption_mode_version")
+        or payload.get("encryptionModeVersion"),
+        "sender_wrapped_mek_b64": payload.get("sender_wrapped_mek_b64")
+        or payload.get("senderWrappedMekB64"),
+        "recipient_wrapped_mek_b64": payload.get("recipient_wrapped_mek_b64")
+        or payload.get("recipientWrappedMekB64"),
+        "iv_b64": payload.get("iv_b64"),
+        "ciphertext_b64": payload.get("ciphertext_b64"),
+        "compliance_wrapped_mek_b64": payload.get("compliance_wrapped_mek_b64"),
+    }
+    policy = validate_dm_write_against_policy(ws_body, path=DmWritePath.E2EE_ENVELOPE)
+    validate_e2ee_envelope_fields(ws_body)
+
+    required = ["recipientId", "iv_b64", "ciphertext_b64"]
     for key in required:
         if key not in payload:
             raise HTTPException(status_code=400, detail=f"Missing {key}")
+
+    sender_mek = ws_body["sender_wrapped_mek_b64"]
+    recipient_mek = ws_body["recipient_wrapped_mek_b64"]
+    if not sender_mek or not recipient_mek:
+        raise HTTPException(status_code=400, detail="Missing sender/recipient wrapped MEK")
 
     client_message_id = payload.get("client_message_id") or payload.get("clientMessageId")
     if isinstance(client_message_id, str):
@@ -262,9 +288,10 @@ async def dmSend(manager: MessaggingSocketManager, websocket: WebSocket, db: Ses
         recipient_id=int(payload["recipientId"]),
         iv_b64=payload["iv_b64"],
         ciphertext_b64=payload["ciphertext_b64"],
-        sender_wrapped_mek_b64=payload["wrapped_mek_b64"],  # Client sends their own MEK
-        recipient_wrapped_mek_b64=payload["wrapped_mek_b64"],  # For simplicity, store same MEK
-        compliance_wrapped_mek_b64=payload.get("compliance_wrapped_mek_b64"),
+        sender_wrapped_mek_b64=sender_mek,
+        recipient_wrapped_mek_b64=recipient_mek,
+        compliance_wrapped_mek_b64=None,
+        encryption_mode=policy.mode,
         reply_to_id=payload.get("replyToId") if isinstance(payload.get("replyToId"), int) else None,
     )
     db.add(env)
@@ -356,18 +383,45 @@ async def dmEdit(manager: MessaggingSocketManager, websocket: WebSocket, db: Ses
         raise HTTPException(status_code=403, detail="Account deleted")
 
     payload = data
+    ws_body = {
+        "encryption_mode": payload.get("encryption_mode") or payload.get("encryptionMode"),
+        "encryption_mode_version": payload.get("encryption_mode_version")
+        or payload.get("encryptionModeVersion"),
+        "sender_wrapped_mek_b64": payload.get("sender_wrapped_mek_b64")
+        or payload.get("senderWrappedMekB64")
+        or payload.get("wrappedMkSender"),
+        "recipient_wrapped_mek_b64": payload.get("recipient_wrapped_mek_b64")
+        or payload.get("recipientWrappedMekB64")
+        or payload.get("wrappedMkRecipient"),
+        "iv_b64": payload.get("iv") or payload.get("iv_b64"),
+        "ciphertext_b64": payload.get("ciphertext") or payload.get("ciphertext_b64"),
+        "compliance_wrapped_mek_b64": payload.get("compliance_wrapped_mek_b64"),
+    }
+    validate_dm_write_against_policy(ws_body, path=DmWritePath.E2EE_ENVELOPE)
+    validate_e2ee_envelope_fields(ws_body)
+
     env_id = int(payload["id"])
     env: DMEnvelope | None = db.query(DMEnvelope).filter(DMEnvelope.id == env_id).first()
     if not env:
         raise HTTPException(status_code=404, detail="DM not found")
     if env.sender_id != user.id:
         raise HTTPException(status_code=403, detail="You can only edit your own messages")
-    
-    # Replace ciphertext and iv
-    env.iv_b64 = payload["iv"]
-    env.ciphertext_b64 = payload["ciphertext"]
-    env.sender_wrapped_mek_b64 = payload.get("wrappedMk", "")
-    env.recipient_wrapped_mek_b64 = payload.get("wrappedMk", "")
+
+    require_edit_path_matches_message(
+        getattr(env, "encryption_mode", "compliance"),
+        DmWritePath.E2EE_ENVELOPE,
+    )
+
+    sender_mek = ws_body["sender_wrapped_mek_b64"]
+    recipient_mek = ws_body["recipient_wrapped_mek_b64"]
+    if not sender_mek or not recipient_mek:
+        raise HTTPException(status_code=400, detail="Missing sender/recipient wrapped MEK")
+
+    env.iv_b64 = ws_body["iv_b64"]
+    env.ciphertext_b64 = ws_body["ciphertext_b64"]
+    env.sender_wrapped_mek_b64 = sender_mek
+    env.recipient_wrapped_mek_b64 = recipient_mek
+    env.compliance_wrapped_mek_b64 = None
     db.commit()
     db.refresh(env)
 

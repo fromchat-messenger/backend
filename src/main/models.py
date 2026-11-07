@@ -89,6 +89,7 @@ class DMEnvelope(Base):
     sender_wrapped_mek_b64 = Column(Text, nullable=False)
     recipient_wrapped_mek_b64 = Column(Text, nullable=False)
     compliance_wrapped_mek_b64 = Column(Text, nullable=True)
+    encryption_mode = Column(String(32), nullable=False, default="compliance", server_default="compliance")
     reply_to_id = Column(Integer, nullable=True)
     timestamp = Column(DateTime, default=datetime.now)
     is_edited = Column(Boolean, default=False)

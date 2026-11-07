@@ -4,6 +4,7 @@ fastapi[standard]>=0.116.1
 pydantic>=2.11.7
 sqlalchemy>=2.0.43,<2.1
 psycopg2-binary>=2.9.9
+psycopg[binary]>=3.2.0
 bcrypt>=4.3.0
 websockets>=15.0.1
 Pillow>=10.0.0

@@ -24,7 +24,9 @@ def load_compliance_private_key(key_file: str = "compliance_keypair.txt") -> X25
         if line.startswith("PRIVATE_KEY="):
             private_key_b64 = line.split("=", 1)[1].strip()
             break
-        elif len(line) == 43 and line.endswith("=") and "=" in line:  # Base64 X25519 private key
+        elif line.startswith("PRIVATE KEY"):
+            continue
+        elif len(line) in (43, 44) and line.endswith("="):
             private_key_b64 = line
             break
 

@@ -40,8 +40,46 @@ from ..service_calls import (
 )
 from .messaging import messagingManager, convert_dm_envelope, convert_dm_envelope_for_user
 from ..push_service import push_service
+from ..dm_encryption_guards import (
+    DmWritePath,
+    require_compliance_wrapped_mek_after_process,
+    require_edit_path_matches_message,
+    validate_compliance_transport_body,
+    validate_dm_write_against_policy,
+    validate_e2ee_envelope_fields,
+)
 
 logger = logging.getLogger("uvicorn.error")
+
+
+async def _notify_dm_envelope_created(
+    db: Session,
+    dm_envelope: DMEnvelope,
+    current_user: User,
+    *,
+    client_message_id: Optional[str] = None,
+) -> None:
+    recipient_payload = convert_dm_envelope_for_user(
+        db, dm_envelope, dm_envelope.recipient_id,
+    )
+    await messagingManager.send_update_to_user(
+        dm_envelope.recipient_id, "dmNew", recipient_payload, db,
+    )
+
+    sender_payload = convert_dm_envelope_for_user(
+        db,
+        dm_envelope,
+        dm_envelope.sender_id,
+        sender_client_message_id=client_message_id,
+    )
+    await messagingManager.send_update_to_user(
+        dm_envelope.sender_id, "dmNew", sender_payload, db,
+    )
+
+    try:
+        await push_service.send_dm_notification(db, dm_envelope, current_user)
+    except Exception as e:
+        logger.error("Failed to send push notification for DM %s: %s", dm_envelope.id, e)
 
 
 def _compliance_public_key_required() -> bool:
@@ -73,6 +111,8 @@ class SendEncryptedMessageRequest(BaseModel):
     transport_ciphertext_b64: str
     sender_public_key_b64: str
     recipient_public_key_b64: str
+    encryption_mode: str
+    encryption_mode_version: int
     client_message_id: Optional[str] = None
     reply_to_id: Optional[int] = None
     files: list[FileModel] = Field(default_factory=list, alias="transport_files")
@@ -80,6 +120,7 @@ class SendEncryptedMessageRequest(BaseModel):
 
     class Config:
         allow_population_by_field_name = True
+        extra = "forbid"
 
 
 class EditEncryptedMessageRequest(BaseModel):
@@ -89,6 +130,45 @@ class EditEncryptedMessageRequest(BaseModel):
     transport_ciphertext_b64: str
     sender_public_key_b64: str
     recipient_public_key_b64: str
+    encryption_mode: str
+    encryption_mode_version: int
+
+    class Config:
+        extra = "forbid"
+
+
+class E2eeUploadedFile(BaseModel):
+    upload_id: str
+    nonce_b64: str
+    filename: Optional[str] = None
+
+
+class SendDmEnvelopeRequest(BaseModel):
+    recipient_id: int
+    iv_b64: str
+    ciphertext_b64: str
+    sender_wrapped_mek_b64: str
+    recipient_wrapped_mek_b64: str
+    encryption_mode: str
+    encryption_mode_version: int
+    client_message_id: Optional[str] = None
+    reply_to_id: Optional[int] = None
+    uploaded_files: list[E2eeUploadedFile] = Field(default_factory=list)
+
+    class Config:
+        extra = "forbid"
+
+
+class EditDmEnvelopeRequest(BaseModel):
+    iv_b64: str
+    ciphertext_b64: str
+    sender_wrapped_mek_b64: str
+    recipient_wrapped_mek_b64: str
+    encryption_mode: str
+    encryption_mode_version: int
+
+    class Config:
+        extra = "forbid"
 
 
 class InitResumableUploadRequest(BaseModel):
@@ -231,6 +311,12 @@ async def send_encrypted_message(
     enforce_dm_send_rate_limit(current_user.id)
 
     try:
+        policy = validate_dm_write_against_policy(
+            request.model_dump(),
+            path=DmWritePath.COMPLIANCE_TRANSPORT,
+        )
+        validate_compliance_transport_body(request.model_dump())
+
         # Verify recipient exists
         recipient = db.query(User).filter(User.id == request.recipient_id).first()
         if not recipient:
@@ -315,6 +401,9 @@ async def send_encrypted_message(
         )
 
         msg = processed["message"]
+        compliance_mek = processed.get("compliance_wrapped_mek")
+        require_compliance_wrapped_mek_after_process(compliance_mek)
+
         dm_envelope = DMEnvelope(
             sender_id=current_user.id,
             recipient_id=request.recipient_id,
@@ -322,7 +411,8 @@ async def send_encrypted_message(
             ciphertext_b64=msg["ciphertext"],
             sender_wrapped_mek_b64=processed["sender_wrapped_mek"],
             recipient_wrapped_mek_b64=processed["recipient_wrapped_mek"],
-            compliance_wrapped_mek_b64=processed["compliance_wrapped_mek"],
+            compliance_wrapped_mek_b64=compliance_mek,
+            encryption_mode=policy.mode,
             reply_to_id=request.reply_to_id,
         )
 
@@ -377,24 +467,12 @@ async def send_encrypted_message(
             request.recipient_id,
         )
 
-        # Send user-specific WebSocket updates (each user gets only their MEK and files metadata)
-        recipient_payload = convert_dm_envelope_for_user(
-            db, dm_envelope, dm_envelope.recipient_id,
-        )
-        await messagingManager.send_update_to_user(dm_envelope.recipient_id, "dmNew", recipient_payload, db)
-
-        sender_payload = convert_dm_envelope_for_user(
+        await _notify_dm_envelope_created(
             db,
             dm_envelope,
-            dm_envelope.sender_id,
-            sender_client_message_id=request.client_message_id,
+            current_user,
+            client_message_id=request.client_message_id,
         )
-        await messagingManager.send_update_to_user(dm_envelope.sender_id, "dmNew", sender_payload, db)
-
-        try:
-            await push_service.send_dm_notification(db, dm_envelope, current_user)
-        except Exception as e:
-            logger.error("Failed to send push notification for DM %s: %s", dm_envelope.id, e)
 
         return {
             "id": dm_envelope.id,
@@ -427,6 +505,100 @@ async def send_encrypted_message(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to send message"
         )
+
+
+@router.post("/send-envelope")
+async def send_dm_envelope(
+    request: SendDmEnvelopeRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Store a client-built E2EE DM envelope (no messaging service /process)."""
+    enforce_dm_send_rate_limit(current_user.id)
+
+    body = request.model_dump()
+    policy = validate_dm_write_against_policy(body, path=DmWritePath.E2EE_ENVELOPE)
+    validate_e2ee_envelope_fields(body)
+
+    recipient = db.query(User).filter(User.id == request.recipient_id).first()
+    if not recipient:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Recipient not found")
+    if current_user.id == request.recipient_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot send messages to yourself",
+        )
+
+    dm_envelope = DMEnvelope(
+        sender_id=current_user.id,
+        recipient_id=request.recipient_id,
+        iv_b64=request.iv_b64,
+        ciphertext_b64=request.ciphertext_b64,
+        sender_wrapped_mek_b64=request.sender_wrapped_mek_b64,
+        recipient_wrapped_mek_b64=request.recipient_wrapped_mek_b64,
+        compliance_wrapped_mek_b64=None,
+        encryption_mode=policy.mode,
+        reply_to_id=request.reply_to_id,
+    )
+    db.add(dm_envelope)
+    db.commit()
+    db.refresh(dm_envelope)
+
+    try:
+        for attachment in request.uploaded_files:
+            uploaded_payload = await get_resumable_upload_blob_path_in_storage(
+                attachment.upload_id, current_user.id,
+            )
+            filename = attachment.filename or uploaded_payload.get("filename") or "file"
+            file_storage_result = await store_encrypted_file_from_path(
+                source_path=str(uploaded_payload["encrypted_file_path"]),
+                filename=str(filename),
+                content_type="application/octet-stream",
+                sender_id=current_user.id,
+                recipient_id=request.recipient_id,
+            )
+            df = DMFile(
+                message_id=dm_envelope.id,
+                sender_id=current_user.id,
+                recipient_id=request.recipient_id,
+                path=file_storage_result.get("path")
+                or f"/uploads/files/encrypted/{file_storage_result['file_id']}",
+                name=Path(str(filename)).name,
+                nonce_b64=attachment.nonce_b64,
+            )
+            db.add(df)
+        db.commit()
+        for attachment in request.uploaded_files:
+            try:
+                await delete_resumable_upload_in_storage(attachment.upload_id, current_user.id)
+            except Exception as cleanup_error:
+                logger.warning(
+                    "Failed to cleanup resumable upload %s: %s",
+                    attachment.upload_id,
+                    cleanup_error,
+                )
+    except HTTPException:
+        raise
+    except Exception:
+        db.rollback()
+        raise
+
+    db.refresh(dm_envelope)
+    await _notify_dm_envelope_created(
+        db,
+        dm_envelope,
+        current_user,
+        client_message_id=request.client_message_id,
+    )
+
+    return {
+        "id": dm_envelope.id,
+        "sender_id": dm_envelope.sender_id,
+        "recipient_id": dm_envelope.recipient_id,
+        "timestamp": dm_envelope.timestamp.isoformat(),
+        "client_message_id": request.client_message_id,
+        "reply_to_id": dm_envelope.reply_to_id,
+    }
 
 
 # ============================================================================
@@ -884,6 +1056,12 @@ async def edit_encrypted_message(
         Updated message info
     """
     try:
+        validate_dm_write_against_policy(
+            request.model_dump(),
+            path=DmWritePath.COMPLIANCE_TRANSPORT,
+        )
+        validate_compliance_transport_body(request.model_dump())
+
         # Find the message
         msg = db.query(DMEnvelope).filter(
             DMEnvelope.id == message_id,
@@ -901,6 +1079,11 @@ async def edit_encrypted_message(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Cannot edit others' messages"
             )
+
+        require_edit_path_matches_message(
+            getattr(msg, "encryption_mode", "compliance"),
+            DmWritePath.COMPLIANCE_TRANSPORT,
+        )
 
         # Fetch compliance public key and process through messaging service
         compliance_key_response = await get_compliance_public_key()
@@ -924,6 +1107,8 @@ async def edit_encrypted_message(
 
         # Update the message with new processed content (commit first so edit always succeeds)
         processed_msg = processed["message"]
+        compliance_mek = processed.get("compliance_wrapped_mek")
+        require_compliance_wrapped_mek_after_process(compliance_mek)
         prev_ciphertext = msg.ciphertext_b64
         prev_iv = msg.iv_b64
         prev_wrapped_mek = msg.compliance_wrapped_mek_b64 or ""
@@ -931,7 +1116,7 @@ async def edit_encrypted_message(
         msg.iv_b64 = processed_msg["nonce"]
         msg.sender_wrapped_mek_b64 = processed["sender_wrapped_mek"]
         msg.recipient_wrapped_mek_b64 = processed["recipient_wrapped_mek"]
-        msg.compliance_wrapped_mek_b64 = processed["compliance_wrapped_mek"]
+        msg.compliance_wrapped_mek_b64 = compliance_mek
         msg.is_edited = True
 
         db.commit()
@@ -987,6 +1172,57 @@ async def edit_encrypted_message(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to edit message"
         )
+
+
+@router.put("/edit-envelope/{message_id}")
+async def edit_dm_envelope(
+    message_id: int,
+    request: EditDmEnvelopeRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Edit an E2EE DM envelope (client-built ciphertext, no messaging /process)."""
+    body = request.model_dump()
+    validate_dm_write_against_policy(body, path=DmWritePath.E2EE_ENVELOPE)
+    validate_e2ee_envelope_fields(body)
+
+    msg = db.query(DMEnvelope).filter(
+        DMEnvelope.id == message_id,
+        DMEnvelope.deleted_at.is_(None),
+    ).first()
+    if not msg:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found")
+    if msg.sender_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Cannot edit others' messages",
+        )
+    require_edit_path_matches_message(
+        getattr(msg, "encryption_mode", "compliance"),
+        DmWritePath.E2EE_ENVELOPE,
+    )
+
+    msg.iv_b64 = request.iv_b64
+    msg.ciphertext_b64 = request.ciphertext_b64
+    msg.sender_wrapped_mek_b64 = request.sender_wrapped_mek_b64
+    msg.recipient_wrapped_mek_b64 = request.recipient_wrapped_mek_b64
+    msg.compliance_wrapped_mek_b64 = None
+    msg.is_edited = True
+    db.commit()
+    db.refresh(msg)
+
+    recipient_payload = convert_dm_envelope(db, msg, msg.recipient_id)
+    await messagingManager.send_update_to_user(msg.recipient_id, "dmEdited", recipient_payload, db)
+    sender_payload = convert_dm_envelope(db, msg, msg.sender_id)
+    await messagingManager.send_update_to_user(msg.sender_id, "dmEdited", sender_payload, db)
+
+    return {
+        "id": msg.id,
+        "sender_id": msg.sender_id,
+        "recipient_id": msg.recipient_id,
+        "timestamp": msg.timestamp.isoformat(),
+        "is_edited": msg.is_edited,
+    }
 
 
 @router.delete("/{message_id}")

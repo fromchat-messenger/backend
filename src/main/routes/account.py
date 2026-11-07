@@ -35,6 +35,7 @@ from ..deleted_user import (
 import os
 
 from ..security.audit import log_security
+from ..instance_encryption import build_instance_info_payload, ensure_instance_encryption_file
 from ..security.chat_filter import contains_profanity
 from ..security.rate_limit import rate_limit_per_ip
 from ..key_lifecycle import destroy_message_keys_for_user
@@ -184,6 +185,13 @@ def convert_user_for_dm_conversation(user: User, db: Session, viewer_id: int | N
 def get_instance_id_public():
     """Public deploy fingerprint (used when the client changes server host/port)."""
     return {"instance_id": get_server_instance_id()}
+
+
+@router.get("/instance/info")
+def get_instance_info_public():
+    """Public instance fingerprint and encryption policy (no auth)."""
+    ensure_instance_encryption_file()
+    return build_instance_info_payload(get_server_instance_id())
 
 
 @router.get("/check_auth")
