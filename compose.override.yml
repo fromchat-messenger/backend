@@ -1,0 +1,5 @@
+# Local dev: keep the services network reachable from the host when needed.
+# If inter-container TCP times out, run scripts/ensure-docker-forwarding.sh (legacy FORWARD DROP).
+networks:
+  services:
+    internal: false

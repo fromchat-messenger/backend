@@ -19,7 +19,7 @@ from ..models import DMEnvelope, Message, MessageFile, ModerationEvent, User
 from ..routes.account import get_server_instance_id
 from ..security.audit import log_security
 from ..security.chat_filter import contains_profanity
-from src.shared.message_retention import get_message_retention
+from shared.message_retention import get_message_retention
 from ..constants import CHAT_FILTER_DISABLED
 
 router = APIRouter(prefix="/admin", tags=["admin"])
