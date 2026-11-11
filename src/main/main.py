@@ -290,10 +290,13 @@ _cors_origins = [
     "https://fromchat.ru",
     "https://beta.fromchat.ru",
     "https://www.fromchat.ru",
+    "https://admin.fromchat.ru",
     "http://127.0.0.1:8301",
     "http://127.0.0.1:8300",
+    "http://127.0.0.1:8304",
     "http://localhost:8301",
     "http://localhost:8300",
+    "http://localhost:8304",
 ]
 
 _extra_cors = (os.getenv("CORS_EXTRA_ORIGINS") or "").strip()
