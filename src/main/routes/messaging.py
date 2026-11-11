@@ -247,6 +247,18 @@ def _monitor_public_message_activity(user: User, content: str, message_id: int, 
             revoke_all_user_sessions(db, user.id)
         except Exception:
             pass
+        try:
+            from ..admin.moderation_events import record_moderation_event
+
+            record_moderation_event(
+                db,
+                event_type=event,
+                user_id=user.id,
+                reason=reason,
+                detail=extra,
+            )
+        except Exception:
+            pass
         db.commit()
         log_security(
             event,
@@ -919,6 +931,20 @@ async def _send_message_internal(
 
     # Check for profanity and reject the message instead of censoring
     if raw_content and contains_profanity(raw_content):
+        try:
+            from ..admin.stats_store import increment_messages_blocked
+            from ..admin.moderation_events import record_moderation_event
+
+            increment_messages_blocked()
+            record_moderation_event(
+                db,
+                event_type="profanity_reject",
+                user_id=current_user.id,
+                reason="Public message blocked by filter",
+            )
+            db.commit()
+        except Exception:
+            pass
         raise HTTPException(
             status_code=422,  # Unprocessable Entity - content validation failed
             detail="Message contains inappropriate content and cannot be sent"
@@ -945,6 +971,12 @@ async def _send_message_internal(
 
     try:
         db.flush()
+        try:
+            from ..admin.analytics_store import note_event
+
+            note_event("messages")
+        except Exception:
+            pass
 
         # Handle files if provided (normal, not encrypted)
         if files:
@@ -1930,6 +1962,21 @@ async def _edit_message_internal(
 
     # Check for profanity and reject the edit instead of censoring
     if contains_profanity(raw_content):
+        try:
+            from ..admin.stats_store import increment_messages_blocked
+            from ..admin.moderation_events import record_moderation_event
+
+            increment_messages_blocked()
+            record_moderation_event(
+                db,
+                event_type="profanity_reject",
+                user_id=current_user.id,
+                message_id=message_id,
+                reason="Public message edit blocked by filter",
+            )
+            db.commit()
+        except Exception:
+            pass
         raise HTTPException(
             status_code=422,  # Unprocessable Entity - content validation failed
             detail="Message contains inappropriate content and cannot be sent"
