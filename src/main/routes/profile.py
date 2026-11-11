@@ -1,3 +1,4 @@
+from datetime import datetime
 from pathlib import Path
 import logging
 import re
@@ -535,6 +536,7 @@ async def verify_user(
 # Admin endpoints for user management
 class SuspendUserRequest(BaseModel):
     reason: str
+    until: datetime | None = None
 
 @router.post("/user/{user_id}/suspend")
 async def suspend_user(
@@ -558,13 +560,28 @@ async def suspend_user(
     if target_user.id == 1:
         raise HTTPException(status_code=400, detail="Cannot suspend admin account")
     
-    # Suspend the user
+    if request.until is not None and request.until <= datetime.now():
+        raise HTTPException(status_code=400, detail="Suspension end time must be in the future")
+
     target_user.suspended = True
     target_user.suspension_reason = request.reason
+    target_user.suspension_until = request.until
     from .account import revoke_all_user_sessions
     revoke_all_user_sessions(db, target_user.id)
+    from ..admin.moderation_events import record_moderation_event
+
+    record_moderation_event(
+        db,
+        event_type="admin_suspend_user",
+        user_id=target_user.id,
+        reason=request.reason,
+        detail={
+            "until": request.until.isoformat() if request.until else None,
+            "actor_id": current_user.id,
+        },
+    )
     db.commit()
-    
+
     log_security(
         "admin_suspend_user",
         actor=current_user.username,
@@ -572,6 +589,7 @@ async def suspend_user(
         target_username=target_user.username,
         target_id=target_user.id,
         reason=request.reason,
+        until=request.until.isoformat() if request.until else None,
     )
 
     # Notify, then drop WebSocket connections so stale auth cannot keep sending
@@ -586,7 +604,8 @@ async def suspend_user(
     return {
         "status": "success",
         "message": f"User {target_user.username} has been suspended",
-        "reason": request.reason
+        "reason": request.reason,
+        "until": request.until.isoformat() if request.until else None,
     }
 
 
@@ -610,6 +629,15 @@ async def unsuspend_user(
     # Unsuspend the user
     target_user.suspended = False
     target_user.suspension_reason = None
+    target_user.suspension_until = None
+    from ..admin.moderation_events import record_moderation_event
+
+    record_moderation_event(
+        db,
+        event_type="admin_unsuspend_user",
+        user_id=target_user.id,
+        detail={"actor_id": current_user.id},
+    )
     db.commit()
 
     # Send WebSocket unsuspension message

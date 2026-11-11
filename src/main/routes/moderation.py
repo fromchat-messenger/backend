@@ -1,9 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from typing import List
+from sqlalchemy.orm import Session
 
-from ..constants import OWNER_USERNAME
-from ..dependencies import get_current_user
+from ..dependencies import get_current_user, get_db
 from ..models import User
 from ..security.audit import log_security
 from ..security.chat_filter import (
@@ -27,8 +27,8 @@ router = APIRouter(prefix="/moderation", tags=["moderation"])
 
 
 def _ensure_owner(user: User) -> None:
-    if user.username != OWNER_USERNAME:
-        raise HTTPException(status_code=403, detail="Only owner can perform this action")
+    if user.id != 1:
+        raise HTTPException(status_code=403, detail="Only admin can perform this action")
 
 
 @router.get("/blocklist")
@@ -40,10 +40,20 @@ def list_blocklist(current_user: User = Depends(get_current_user)):
 @router.post("/blocklist")
 def append_blocklist(
     request: BlocklistUpdateRequest,
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     _ensure_owner(current_user)
     added, updated = add_to_blocklist(request.words)
+    from ..admin.moderation_events import record_moderation_event
+
+    record_moderation_event(
+        db,
+        event_type="blocklist_add",
+        user_id=current_user.id,
+        detail={"added": added, "words": request.words},
+    )
+    db.commit()
     log_security(
         "blocklist_add",
         actor=current_user.username,
@@ -56,10 +66,20 @@ def append_blocklist(
 @router.delete("/blocklist")
 def delete_from_blocklist(
     request: BlocklistUpdateRequest,
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     _ensure_owner(current_user)
     removed, updated = remove_from_blocklist(request.words)
+    from ..admin.moderation_events import record_moderation_event
+
+    record_moderation_event(
+        db,
+        event_type="blocklist_remove",
+        user_id=current_user.id,
+        detail={"removed": removed, "words": request.words},
+    )
+    db.commit()
     log_security(
         "blocklist_remove",
         actor=current_user.username,
@@ -70,9 +90,20 @@ def delete_from_blocklist(
 
 
 @router.post("/blocklist/clear")
-def clear_blocklist_endpoint(current_user: User = Depends(get_current_user)):
+def clear_blocklist_endpoint(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     _ensure_owner(current_user)
     updated = clear_blocklist()
+    from ..admin.moderation_events import record_moderation_event
+
+    record_moderation_event(
+        db,
+        event_type="blocklist_clear",
+        user_id=current_user.id,
+    )
+    db.commit()
     log_security(
         "blocklist_clear",
         actor=current_user.username,

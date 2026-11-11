@@ -121,6 +121,17 @@ def _get_current_user(
     # Re-read suspension/deletion after session checks (ban may have landed mid-request)
     db.refresh(user)
 
+    if (
+        user.suspended
+        and user.suspension_until is not None
+        and user.suspension_until <= datetime.now()
+    ):
+        user.suspended = False
+        user.suspension_reason = None
+        user.suspension_until = None
+        db.commit()
+        db.refresh(user)
+
     # Check if user is suspended (before touching last_seen)
     if user.suspended and not allow_suspended:
         logger.info("get_current_user: account suspended for user_id=%s reason=%s", user.id, user.suspension_reason)

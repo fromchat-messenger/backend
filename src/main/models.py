@@ -26,6 +26,7 @@ class User(Base):
     verified = Column(Boolean, default=False)
     suspended = Column(Boolean, default=False)
     suspension_reason = Column(Text, nullable=True)
+    suspension_until = Column(DateTime, nullable=True, index=True)
     deleted = Column(Boolean, default=False)
     # Set when deleted becomes true; used to release yandex_id after the hold period.
     deleted_at = Column(DateTime, nullable=True, index=True)
@@ -49,6 +50,18 @@ class Message(Base):
     reply_to = relationship("Message", remote_side=[id])
     files = relationship("MessageFile", back_populates="message", cascade="all, delete-orphan", lazy="select")
     reactions = relationship("Reaction", cascade="all, delete-orphan", lazy="select")
+
+
+class ModerationEvent(Base):
+    __tablename__ = "moderation_event"
+
+    id = Column(Integer, primary_key=True, index=True)
+    type = Column(String(64), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("user.id"), nullable=True, index=True)
+    message_id = Column(Integer, nullable=True, index=True)
+    reason = Column(Text, nullable=True)
+    detail_json = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.now, index=True)
 
 
 class MessageFile(Base):

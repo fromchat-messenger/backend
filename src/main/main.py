@@ -10,7 +10,23 @@ import logging
 from sqlalchemy.orm.exc import DetachedInstanceError
 
 # Import from same directory
-from .routes import account, messaging, profile, public_chat, push, devices, moderation, download, keys, envelope_messaging, livekit, static as static_routes, auth_steps
+from .routes import (
+    account,
+    messaging,
+    profile,
+    public_chat,
+    push,
+    devices,
+    moderation,
+    download,
+    keys,
+    envelope_messaging,
+    livekit,
+    static as static_routes,
+    auth_steps,
+    admin,
+    admin_extras,
+)
 from .routes.account import get_server_instance_id
 from .models import User
 from .constants import OWNER_USERNAME
@@ -19,6 +35,7 @@ from .db import POOL_CONFIG, SessionLocal
 from .logging_config import access_logger  # noqa: F401 - ensure loggers configured
 from .security.audit import log_access
 from .security.rate_limit import limiter
+from .admin.ip_history import record_ip
 from slowapi.middleware import SlowAPIMiddleware
 
 logger = logging.getLogger("uvicorn.error")
@@ -30,6 +47,9 @@ async def lifespan(app: FastAPI):
     key_lifecycle_task = None
     yandex_id_task = None
     incognito_expiry_task = None
+    message_stats_task = None
+    analytics_task = None
+    suspension_expiry_task = None
 
     # Startup - run migration in subprocess to avoid logging interference
     try:
@@ -138,6 +158,33 @@ async def lifespan(app: FastAPI):
         logger.error("Failed to start incognito session expiry task: %s", e)
         incognito_expiry_task = None
 
+    try:
+        from .message_stats_task import start_message_stats_task
+
+        message_stats_task = asyncio.create_task(start_message_stats_task())
+        logger.info("Admin message stats sync task started")
+    except Exception as e:
+        logger.error("Failed to start message stats sync task: %s", e)
+        message_stats_task = None
+
+    try:
+        from .analytics_task import start_analytics_task
+
+        analytics_task = asyncio.create_task(start_analytics_task())
+        logger.info("Admin analytics sample task started")
+    except Exception as e:
+        logger.error("Failed to start analytics sample task: %s", e)
+        analytics_task = None
+
+    try:
+        from .suspension_task import start_suspension_expiry_task
+
+        suspension_expiry_task = asyncio.create_task(start_suspension_expiry_task())
+        logger.info("Suspension expiry task started")
+    except Exception as e:
+        logger.error("Failed to start suspension expiry task: %s", e)
+        suspension_expiry_task = None
+
     yield
 
     # Shutdown — stop background tasks and force-close WebSockets so Ctrl+C / SIGTERM exits.
@@ -172,6 +219,27 @@ async def lifespan(app: FastAPI):
         incognito_expiry_task.cancel()
         try:
             await incognito_expiry_task
+        except asyncio.CancelledError:
+            pass
+
+    if message_stats_task:
+        message_stats_task.cancel()
+        try:
+            await message_stats_task
+        except asyncio.CancelledError:
+            pass
+
+    if analytics_task:
+        analytics_task.cancel()
+        try:
+            await analytics_task
+        except asyncio.CancelledError:
+            pass
+
+    if suspension_expiry_task:
+        suspension_expiry_task.cancel()
+        try:
+            await suspension_expiry_task
         except asyncio.CancelledError:
             pass
 
@@ -241,6 +309,7 @@ async def access_logging_middleware(request: Request, call_next):
                 logger.info("Incoming request %s %s Authorization=NONE", request.method, request.url.path)
         except Exception:
             pass
+    client_ip = get_client_ip(request)
     start = time.perf_counter()
     try:
         response = await call_next(request)
@@ -253,7 +322,7 @@ async def access_logging_middleware(request: Request, call_next):
             path=request.url.path,
             status="error",
             user=_get_username_for_log(user),
-            ip=get_client_ip(request),
+            ip=client_ip,
             duration=f"{duration:.3f}s",
             error=str(exc),
         )
@@ -261,15 +330,26 @@ async def access_logging_middleware(request: Request, call_next):
     else:
         duration = time.perf_counter() - start
         user = getattr(getattr(request, "state", None), "current_user", None)
+        if user is not None and getattr(user, "id", None):
+            try:
+                record_ip(int(user.id), client_ip)
+            except Exception:
+                pass
         log_access(
             "http_request",
             method=request.method,
             path=request.url.path,
             status=response.status_code,
             user=_get_username_for_log(user),
-            ip=get_client_ip(request),
+            ip=client_ip,
             duration=f"{duration:.3f}s",
         )
+        try:
+            from .admin.analytics_store import note_event
+
+            note_event("requests")
+        except Exception:
+            pass
         return response
 
 
@@ -290,10 +370,13 @@ _cors_origins = [
     "https://fromchat.ru",
     "https://beta.fromchat.ru",
     "https://www.fromchat.ru",
+    "https://admin.fromchat.ru",
     "http://127.0.0.1:8301",
     "http://127.0.0.1:8300",
+    "http://127.0.0.1:8304",
     "http://localhost:8301",
     "http://localhost:8300",
+    "http://localhost:8304",
 ]
 
 _extra_cors = (os.getenv("CORS_EXTRA_ORIGINS") or "").strip()
@@ -339,6 +422,8 @@ app.include_router(push.router, prefix="/push")
 app.include_router(livekit.router, prefix="/livekit")
 app.include_router(devices.router, prefix="/devices")
 app.include_router(moderation.router)
+app.include_router(admin.router)
+app.include_router(admin_extras.router)
 app.include_router(download.router)
 app.include_router(keys.router)
 app.include_router(static_routes.router)
