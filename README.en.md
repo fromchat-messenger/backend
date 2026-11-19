@@ -122,6 +122,21 @@ curl http://localhost:8300/health
 Swagger: `http://localhost:8300/docs`  
 ReDoc: `http://localhost:8300/redoc`
 
+### Admin CLI (local)
+
+Interactive owner/admin shell (user id `1` for encryption changes). Requires `httpx` and `rich` from `requirements.txt`:
+
+```bash
+bash scripts/admin-cli
+# or: python3 -m pip install -r requirements.txt && python3 src/admin_cli.py
+
+./scripts/admin-cli -c encryption-mode
+./scripts/admin-cli --server http://127.0.0.1:8300
+./scripts/admin-cli -c 'login test' -c 'toggle-encryption-mode'  # prompts for password unless scripted
+```
+
+Default server is `https://api.fromchat.ru` (override with `--server` or `FC_ADMIN_API_URL`). At runtime: `server <url>` probes like the mobile app (`/instance_id`, `/instance/info`, `/livekit-health`). Commands: `server`, `encryption-mode`, `set-encryption-mode compliance|e2ee`, `toggle-encryption-mode`, `compliance-mode on|off`.
+
 The web client in dev proxies the backend as `/api` → this `:8300` port.
 
 ### Production edge

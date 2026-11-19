@@ -5,19 +5,125 @@ import base64
 import hashlib
 import hmac
 import os
+import re
 import shlex
 import sys
+import time
 from getpass import getpass
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional
 import readline
 import httpx
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from admin_server_probe import (
+    DEFAULT_PUBLIC_API_BASE,
+    ServerProbeError,
+    ServerProbeOk,
+    probe_server_target,
+)
+
 
 class CLIError(Exception):
     """Generic CLI error with a human-readable message."""
+
+
+VALID_ENCRYPTION_MODES = frozenset({"compliance", "e2ee"})
+
+# readline: bytes between \001 and \002 are excluded from the visible prompt width.
+_RL_NOPRINT_START = "\001"
+_RL_NOPRINT_END = "\002"
+
+# Max positional args per command (None = unlimited). Checked in dispatch after aliases resolve.
+COMMAND_MAX_ARGS: dict[str, Optional[int]] = {
+    "login": 1,
+    "suspend": 1,
+    "ban": 1,
+    "unsuspend": 1,
+    "unban": 1,
+    "delete": 1,
+    "remove": 1,
+    "verify": 1,
+    "unverify": 1,
+    "user": 1,
+    "unblock-ip": 1,
+    "set-encryption-mode": 1,
+    "encryption-mode-set": 1,
+    "compliance-mode": 1,
+    "encryption-mode": 0,
+    "encryption": 0,
+    "instance-info": 0,
+    "toggle-encryption-mode": 0,
+    "toggle-compliance": 0,
+    "help": 0,
+    "whoami": 0,
+    "list": 0,
+    "blocklist": 0,
+    "clear-blocklist": 0,
+    "clear-all-rate-limits": 0,
+    "server": 1,
+    "sleep": 1,
+}
+
+
+_YES_FLAG_TOKENS = frozenset({"-y", "--yes"})
+
+
+def _strip_inline_yes_flags(parts: List[str]) -> tuple[List[str], bool]:
+    """Remove -y / --yes anywhere after the command name."""
+    if not parts:
+        return parts, False
+    assume = False
+    kept = [parts[0]]
+    for token in parts[1:]:
+        if token in _YES_FLAG_TOKENS:
+            assume = True
+        else:
+            kept.append(token)
+    return kept, assume
+
+
+def _split_command_chain(raw: str) -> List[str]:
+    """Split on `&&` (shell-style); does not split inside quotes."""
+    stripped = raw.strip()
+    if not stripped:
+        return []
+    return [segment.strip() for segment in re.split(r"\s+&&\s+", stripped) if segment.strip()]
+
+
+def _colored_input_prompt(identity: str) -> str:
+    """Prompt string safe for GNU readline (history / cursor position)."""
+    s, e = _RL_NOPRINT_START, _RL_NOPRINT_END
+    return (
+        f"{s}\033[36m{e}{identity}"
+        f"{s}\033[0m{e} "
+        f"{s}\033[1m{e}>"
+        f"{s}\033[0m{e} "
+    )
+
+
+def _read_interactive_line(prompt: str) -> str:
+    """One REPL line; works with GNU readline and macOS libedit (no set_prompt)."""
+    try:
+        if hasattr(readline, "set_prompt"):
+            readline.set_prompt(prompt)
+            return readline.readline()
+        return readline.readline(prompt)
+    except Exception:
+        return input(prompt)
+
+
+def _reject_extra_args(command: str, args: List[str]) -> None:
+    limit = COMMAND_MAX_ARGS.get(command)
+    if limit is None:
+        return
+    if len(args) > limit:
+        if limit == 0:
+            raise CLIError(f"Too many arguments for {command} (expected none).")
+        raise CLIError(
+            f"Too many arguments for {command} (expected at most {limit}, got {len(args)}).",
+        )
 
 
 def _hkdf_extract(salt: bytes, ikm: bytes) -> bytes:
@@ -63,12 +169,50 @@ def _read_single_key() -> str:
 
 
 class AdminCLI:
-    def __init__(self, api_url: str) -> None:
+    def __init__(self, api_url: str, *, assume_yes: bool = False, probe: Optional[ServerProbeOk] = None) -> None:
         self.console = Console()
         self.api_url = api_url.rstrip("/")
         self.client = httpx.Client(base_url=self.api_url, timeout=30.0)
         self.username: Optional[str] = None
         self.token: Optional[str] = None
+        self.assume_yes = assume_yes
+        self.last_probe: Optional[ServerProbeOk] = probe
+
+    def close(self) -> None:
+        self.client.close()
+
+    def _replace_client(self, api_base: str) -> None:
+        next_base = api_base.rstrip("/")
+        if self.api_url == next_base:
+            return
+        self.close()
+        self.api_url = next_base
+        self.client = httpx.Client(base_url=self.api_url, timeout=30.0)
+        self.token = None
+        self.username = None
+
+    def _render_server_probe(self, probe: ServerProbeOk, *, unchanged: bool = False) -> None:
+        title = "Server" if unchanged else "Server configured"
+        table = Table(title=title, show_header=False)
+        table.add_row("API", probe.api_base_url)
+        table.add_row("Instance ID", probe.instance_id)
+        table.add_row("HTTPS", "yes" if probe.https_enabled else "no")
+        table.add_row("Calls (LiveKit)", "✅" if probe.calls_ok else "❌")
+        table.add_row("Ping", f"{probe.ping_ms} ms")
+        table.add_row("Encryption", f"{probe.encryption_mode} (v{probe.encryption_mode_version})")
+        self.console.print(table)
+
+    def _apply_server(self, raw: str) -> None:
+        try:
+            probe = probe_server_target(raw)
+        except ServerProbeError as exc:
+            raise CLIError(str(exc)) from exc
+        same = probe.api_base_url.rstrip("/") == self.api_url.rstrip("/")
+        self._replace_client(probe.api_base_url)
+        self.last_probe = probe
+        self._render_server_probe(probe, unchanged=same)
+        if not same:
+            self.console.print("[yellow]Session cleared — login again for this server.[/]")
 
     # --------------------------- HTTP helpers --------------------------- #
     def _auth_headers(self) -> dict:
@@ -111,6 +255,9 @@ class AdminCLI:
         return response.json()
 
     def _confirm(self, prompt: str) -> bool:
+        if self.assume_yes:
+            self.console.print(f"[dim]{prompt} (auto-confirmed)[/]")
+            return True
         self.console.print(f"[bold yellow]{prompt}[/] [green](y)[/] / [red](n)[/]: ", end="")
         choice = _read_single_key()
         self.console.print("")  # move to next line
@@ -142,9 +289,13 @@ class AdminCLI:
         payload = {"username": username, "password": derived_password}
         response = self._request("POST", "auth/steps/password", json=payload, auth=False)
         body = response.json()
+        status = body.get("status")
+        if status == "needs_register":
+            raise CLIError("User does not exist; register via a client first.")
         token = body.get("token")
         if not token:
-            raise CLIError("Authentication succeeded but token was not returned.")
+            hint = f" (status={status})" if status else ""
+            raise CLIError(f"Login did not return a token{hint}.")
         self.token = token
         self.username = username
         self.console.print("[bold green]Login successful.[/]")
@@ -312,6 +463,12 @@ class AdminCLI:
         self.console.print(f"[bold green]{message}[/]")
 
     def cmd_help(self) -> None:
+        self.console.print(
+            "[dim]Chain with && (stops on error). Skip confirmations: "
+            "[cyan]-y[/] anywhere after the command name, e.g. "
+            "[cyan]set-encryption-mode -y e2ee[/] or "
+            "[cyan]sleep 5 && set-encryption-mode e2ee -y[/][/]",
+        )
         cmds = {
             "login [username]": "Authenticate as owner/admin.",
             "suspend <user>": "Suspend account (alias: ban).",
@@ -328,6 +485,12 @@ class AdminCLI:
             "list": "List all users.",
             "user <user>": "Show detailed user information.",
             "whoami": "Display current session context.",
+            "server [url]": "Show or switch API server (probed like the app).",
+            "encryption-mode": "Show instance encryption mode (public /instance/info).",
+            "set-encryption-mode <mode>": "Set mode to compliance or e2ee (admin user id 1).",
+            "toggle-encryption-mode": "Switch compliance ↔ e2ee (admin user id 1).",
+            "compliance-mode <on|off>": "Enable or disable compliance encryption mode.",
+            "sleep <seconds>": "Pause before the next command (use with &&).",
             "help": "Show this help panel.",
             "exit": "Quit the CLI.",
         }
@@ -339,19 +502,206 @@ class AdminCLI:
         self.console.print(table)
 
     def cmd_whoami(self) -> None:
+        self.console.print(f"[cyan]Server[/] [bold]{self.api_url}[/]")
         if not self.token:
             self.console.print("[yellow]Not authenticated.[/]")
             return
-        self.console.print(f"[green]Logged in as[/] [bold]{self.username}[/] ({self.api_url})")
+        self.console.print(f"[green]Logged in as[/] [bold]{self.username}[/]")
+
+    def cmd_server(self, args: List[str]) -> None:
+        if not args:
+            if self.last_probe is not None:
+                self._render_server_probe(self.last_probe, unchanged=True)
+            else:
+                self.console.print(f"[cyan]Server[/] [bold]{self.api_url}[/]")
+            return
+        self._apply_server(args[0])
+
+    def _fetch_instance_info(self) -> dict:
+        return self._request("GET", "instance/info", auth=False).json()
+
+    def _render_instance_encryption(self, info: dict) -> None:
+        mode = info.get("encryption_mode", "?")
+        style = "green" if mode == "compliance" else "cyan"
+        table = Table(title="Instance encryption", show_header=False)
+        table.add_row("Instance ID", str(info.get("instance_id", "")))
+        table.add_row("Mode", f"[{style}]{mode}[/]")
+        table.add_row("Version", str(info.get("encryption_mode_version", "")))
+        table.add_row("Changed at", str(info.get("encryption_mode_changed_at", "")))
+        self.console.print(table)
+
+    def cmd_encryption_mode(self, _args: List[str]) -> None:
+        self._render_instance_encryption(self._fetch_instance_info())
+
+    def cmd_set_encryption_mode(self, args: List[str]) -> None:
+        if not args:
+            raise CLIError("Usage: set-encryption-mode <compliance|e2ee>")
+        mode = args[0].strip().lower()
+        if mode not in VALID_ENCRYPTION_MODES:
+            raise CLIError("Mode must be compliance or e2ee.")
+        self._require_auth()
+        current = self._fetch_instance_info()
+        previous = current.get("encryption_mode")
+        if previous == mode:
+            self.console.print(f"[yellow]Encryption mode is already [bold]{mode}[/].[/]")
+            self._render_instance_encryption(current)
+            return
+        self.console.print(Panel.fit(f"[bold]Set encryption mode → {mode}[/]", style="yellow"))
+        self._render_instance_encryption(current)
+        if not self._confirm(f"Change encryption mode from {previous} to {mode}?"):
+            self.console.print("[yellow]Cancelled.[/]")
+            return
+        info = self._request(
+            "PATCH",
+            "admin/encryption-mode",
+            params={"broadcast": "true"},
+            json={"mode": mode},
+        ).json()
+        self.console.print("[bold green]Encryption mode updated.[/]")
+        self._render_instance_encryption(info)
+
+    def cmd_toggle_encryption_mode(self, _args: List[str]) -> None:
+        current = self._fetch_instance_info().get("encryption_mode")
+        if current not in VALID_ENCRYPTION_MODES:
+            raise CLIError(f"Unknown current encryption mode: {current!r}")
+        target = "e2ee" if current == "compliance" else "compliance"
+        self.cmd_set_encryption_mode([target])
+
+    def cmd_sleep(self, args: List[str]) -> None:
+        if not args:
+            raise CLIError("Usage: sleep <seconds>")
+        try:
+            seconds = float(args[0])
+        except ValueError as exc:
+            raise CLIError("sleep: seconds must be a number") from exc
+        if seconds < 0:
+            raise CLIError("sleep: seconds must be non-negative")
+        if seconds > 86_400:
+            raise CLIError("sleep: seconds too large (max 86400)")
+        time.sleep(seconds)
+
+    def cmd_compliance_mode(self, args: List[str]) -> None:
+        if not args:
+            raise CLIError("Usage: compliance-mode <on|off>")
+        switch = args[0].strip().lower()
+        if switch in {"on", "1", "true", "enable", "compliance"}:
+            self.cmd_set_encryption_mode(["compliance"])
+        elif switch in {"off", "0", "false", "disable", "e2ee"}:
+            self.cmd_set_encryption_mode(["e2ee"])
+        else:
+            raise CLIError("Use compliance-mode on or compliance-mode off.")
+
+    def _dispatch_command(self, command: str, args: List[str]) -> Optional[bool]:
+        """Run one command. Return False to exit the REPL, None/True to continue."""
+        if command in {"exit", "quit"}:
+            self.console.print("[red]Goodbye.[/]")
+            return False
+
+        _reject_extra_args(command, args)
+
+        if command == "login":
+            self.cmd_login(args)
+        elif command in {"suspend", "ban"}:
+            self.cmd_suspend(args)
+        elif command in {"unsuspend", "unban"}:
+            self.cmd_unsuspend(args)
+        elif command == "block-word":
+            self.cmd_block_word(args)
+        elif command == "unblock-word":
+            self.cmd_unblock_word(args)
+        elif command == "blocklist":
+            self.cmd_list_blocklist()
+        elif command == "clear-blocklist":
+            self.cmd_clear_blocklist()
+        elif command == "unblock-ip":
+            self.cmd_unblock_ip(args)
+        elif command == "clear-all-rate-limits":
+            self.cmd_clear_all_rate_limits()
+        elif command == "verify":
+            self.cmd_verify(args)
+        elif command == "unverify":
+            self.cmd_unverify(args)
+        elif command in {"delete", "remove"}:
+            self.cmd_delete(args)
+        elif command == "list":
+            self.cmd_list_users()
+        elif command == "user":
+            self.cmd_user(args)
+        elif command == "help":
+            self.cmd_help()
+        elif command == "whoami":
+            self.cmd_whoami()
+        elif command == "server":
+            self.cmd_server(args)
+        elif command in {"encryption-mode", "encryption", "instance-info"}:
+            self.cmd_encryption_mode(args)
+        elif command in {"set-encryption-mode", "encryption-mode-set"}:
+            self.cmd_set_encryption_mode(args)
+        elif command in {"toggle-encryption-mode", "toggle-compliance"}:
+            self.cmd_toggle_encryption_mode(args)
+        elif command == "compliance-mode":
+            self.cmd_compliance_mode(args)
+        elif command == "sleep":
+            self.cmd_sleep(args)
+        else:
+            self.console.print("[yellow]Unknown command. Type help for a list of commands.[/]")
+        return True
+
+    def _run_one_command(self, raw: str) -> Optional[bool]:
+        try:
+            parts = shlex.split(raw)
+        except ValueError as exc:
+            raise CLIError(f"Parse error: {exc}") from exc
+        if not parts:
+            return True
+        parts, local_yes = _strip_inline_yes_flags(parts)
+        command = parts[0].lstrip("/").lower()
+        args = parts[1:]
+        previous_yes = self.assume_yes
+        if local_yes:
+            self.assume_yes = True
+        try:
+            return self._dispatch_command(command, args)
+        finally:
+            self.assume_yes = previous_yes
+
+    def _parse_and_run(self, raw: str) -> Optional[bool]:
+        segments = _split_command_chain(raw)
+        if not segments:
+            return True
+        for segment in segments:
+            try:
+                outcome = self._run_one_command(segment)
+            except CLIError as err:
+                self.console.print(f"[red]Error:[/] {err}")
+                return True
+            except httpx.RequestError as err:
+                self.console.print(f"[red]Network error:[/] {err}")
+                return True
+            if outcome is False:
+                return False
+        return True
+
+    def _readline_prompt(self) -> str:
+        return _colored_input_prompt(self.username or "guest")
 
     # --------------------------- Main loop ------------------------------ #
     def run(self) -> None:
         self.console.print(Panel.fit("[bold magenta]FromChat Admin CLI[/]", style="magenta"))
-        while True:
-            prompt_identity = self.username or "guest"
+        if self.last_probe is not None:
+            self._render_server_probe(self.last_probe, unchanged=True)
+        histfile = os.path.expanduser("~/.fromchat_admin_cli_history")
+        if hasattr(readline, "read_history_file"):
             try:
-                prompt_str = f"\033[36m{prompt_identity}\033[0m \033[1m>\033[0m "
-                raw = input(prompt_str).strip()
+                readline.read_history_file(histfile)
+            except FileNotFoundError:
+                pass
+        if hasattr(readline, "set_history_length"):
+            readline.set_history_length(500)
+
+        while True:
+            try:
+                raw = _read_interactive_line(self._readline_prompt()).strip()
             except (KeyboardInterrupt, EOFError):
                 self.console.print("\n[red]Exiting...[/]")
                 break
@@ -360,70 +710,85 @@ class AdminCLI:
                 continue
 
             try:
-                parts = shlex.split(raw)
-            except ValueError as exc:
-                self.console.print(f"[red]Parse error:[/] {exc}")
-                continue
-
-            command = parts[0].lstrip("/").lower()
-            args = parts[1:]
-
-            if command in {"exit", "quit"}:
-                self.console.print("[red]Goodbye.[/]")
-                break
-
-            try:
-                if command == "login":
-                    self.cmd_login(args)
-                elif command in {"suspend", "ban"}:
-                    self.cmd_suspend(args)
-                elif command in {"unsuspend", "unban"}:
-                    self.cmd_unsuspend(args)
-                elif command == "block-word":
-                    self.cmd_block_word(args)
-                elif command == "unblock-word":
-                    self.cmd_unblock_word(args)
-                elif command == "blocklist":
-                    self.cmd_list_blocklist()
-                elif command == "clear-blocklist":
-                    self.cmd_clear_blocklist()
-                elif command == "unblock-ip":
-                    self.cmd_unblock_ip(args)
-                elif command == "clear-all-rate-limits":
-                    self.cmd_clear_all_rate_limits()
-                elif command == "verify":
-                    self.cmd_verify(args)
-                elif command == "unverify":
-                    self.cmd_unverify(args)
-                elif command in {"delete", "remove"}:
-                    self.cmd_delete(args)
-                elif command == "list":
-                    self.cmd_list_users()
-                elif command == "user":
-                    self.cmd_user(args)
-                elif command == "help":
-                    self.cmd_help()
-                elif command == "whoami":
-                    self.cmd_whoami()
-                else:
-                    self.console.print("[yellow]Unknown command. Type /help for a list of commands.[/]")
+                if self._parse_and_run(raw) is False:
+                    break
             except CLIError as err:
                 self.console.print(f"[red]Error:[/] {err}")
             except httpx.RequestError as err:
                 self.console.print(f"[red]Network error:[/] {err}")
 
-        self.client.close()
+        if hasattr(readline, "write_history_file"):
+            try:
+                readline.write_history_file(histfile)
+            except OSError:
+                pass
+        self.close()
+
+
+def _initial_server_url(cli_args: argparse.Namespace) -> str:
+    if cli_args.server:
+        return cli_args.server
+    return os.getenv("FC_ADMIN_API_URL", DEFAULT_PUBLIC_API_BASE)
+
+
+def _bootstrap_cli(cli_args: argparse.Namespace) -> AdminCLI:
+    target = _initial_server_url(cli_args)
+    try:
+        probe = probe_server_target(target)
+    except ServerProbeError as exc:
+        raise CLIError(f"Cannot reach server {target!r}: {exc}") from exc
+    cli = AdminCLI(probe.api_base_url, assume_yes=cli_args.yes, probe=probe)
+    return cli
 
 
 def main(argv: Optional[Iterable[str]] = None) -> None:
     parser = argparse.ArgumentParser(description="FromChat Emergency Admin CLI")
     parser.add_argument(
+        "--server",
+        metavar="URL",
+        default=None,
+        help=f"API server host or URL (default: {DEFAULT_PUBLIC_API_BASE}; override with FC_ADMIN_API_URL).",
+    )
+    parser.add_argument(
         "--api-url",
-        default=os.getenv("FC_ADMIN_API_URL", "http://127.0.0.1:8300"),
-        help="Base API URL for the FromChat backend (default: %(default)s).",
+        dest="server",
+        metavar="URL",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "-c",
+        "--command",
+        action="append",
+        metavar="CMD",
+        help="Run a command non-interactively (repeat for multiple). Implies login prompts when needed.",
+    )
+    parser.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="Skip all confirmation prompts for the session (per-command: -y after the command name).",
     )
     args = parser.parse_args(list(argv) if argv is not None else None)
-    cli = AdminCLI(args.api_url)
+    try:
+        cli = _bootstrap_cli(args)
+    except CLIError as exc:
+        Console().print(f"[red]Error:[/] {exc}")
+        raise SystemExit(1) from exc
+
+    if args.command:
+        exit_code = 0
+        for line in args.command:
+            try:
+                if cli._parse_and_run(line) is False:
+                    break
+            except CLIError as err:
+                cli.console.print(f"[red]Error:[/] {err}")
+                exit_code = 1
+            except httpx.RequestError as err:
+                cli.console.print(f"[red]Network error:[/] {err}")
+                exit_code = 1
+        cli.close()
+        raise SystemExit(exit_code)
     cli.run()
 
 

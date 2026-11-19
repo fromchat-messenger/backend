@@ -104,6 +104,18 @@ curl http://localhost:8300/health
 Swagger: `http://localhost:8300/docs`  
 ReDoc: `http://localhost:8300/redoc`
 
+### Admin CLI (локально)
+
+Интерактивная консоль владельца (смена режима шифрования — только user id `1`). Зависимости: `httpx`, `rich` из `requirements.txt`:
+
+```bash
+bash scripts/admin-cli
+./scripts/admin-cli -c encryption-mode
+./scripts/admin-cli --server http://127.0.0.1:8300
+```
+
+По умолчанию `https://api.fromchat.ru` (`--server` или `FC_ADMIN_API_URL`). В сессии: `server <url>` — проверка как в приложении. Команды: `server`, `encryption-mode`, `set-encryption-mode compliance|e2ee`, `toggle-encryption-mode`, `compliance-mode on|off`.
+
 Клиентский web в dev проксирует backend как `/api` → сюда на `:8300`.
 
 ### Production edge

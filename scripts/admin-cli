@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+
+if [[ -d "${ROOT}/.venv" ]]; then
+  # shellcheck disable=SC1091
+  source "${ROOT}/.venv/bin/activate"
+elif ! python3 -c "import httpx, rich" 2>/dev/null; then
+  echo "Missing dependencies. Run: python3 -m pip install -r requirements.txt" >&2
+  exit 1
+fi
+
+exec python3 "${ROOT}/src/admin_cli.py" "$@"
