@@ -26,12 +26,27 @@ class User(Base):
     verified = Column(Boolean, default=False)
     suspended = Column(Boolean, default=False)
     suspension_reason = Column(Text, nullable=True)
+    suspended_until = Column(DateTime, nullable=True, index=True)
     deleted = Column(Boolean, default=False)
     # Set when deleted becomes true; used to release yandex_id after the hold period.
     deleted_at = Column(DateTime, nullable=True, index=True)
     # Opaque Yandex subject (id/psuid); never store Yandex profile PII here.
     yandex_id = Column(String(128), unique=True, nullable=True, index=True)
     messages = relationship("Message", back_populates="author", lazy="select")
+
+
+class ModerationEvent(Base):
+    __tablename__ = "moderation_event"
+
+    id = Column(Integer, primary_key=True, index=True)
+    created_at = Column(DateTime, default=datetime.now, nullable=False)
+    source = Column(String(32), nullable=False)
+    user_id = Column(Integer, nullable=True)
+    ip = Column(String(64), nullable=True)
+    text_preview = Column(String(500), nullable=True)
+    reason_code = Column(String(64), nullable=False)
+    reason_detail = Column(String(255), nullable=False)
+    message_id = Column(Integer, nullable=True)
 
 
 class Message(Base):
@@ -313,6 +328,7 @@ class UserProfileResponse(BaseModel):
     verification_status: str
     suspended: bool
     suspension_reason: str | None
+    suspended_until: datetime | None = None
     deleted: bool
 
     class Config:

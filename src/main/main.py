@@ -10,7 +10,25 @@ import logging
 from sqlalchemy.orm.exc import DetachedInstanceError
 
 # Import from same directory
-from .routes import account, messaging, profile, public_chat, push, devices, moderation, download, keys, envelope_messaging, livekit, static as static_routes, auth_steps, admin_encryption
+from .routes import (
+    account,
+    messaging,
+    profile,
+    public_chat,
+    push,
+    devices,
+    moderation,
+    download,
+    keys,
+    envelope_messaging,
+    livekit,
+    static as static_routes,
+    auth_steps,
+    admin_encryption,
+    admin_panel,
+    admin_metrics_ws,
+)
+from .user_suspension import lift_expired_suspensions
 from .instance_encryption import ensure_instance_encryption_file
 from .routes.account import get_server_instance_id
 from .models import User
@@ -190,6 +208,17 @@ app = FastAPI(title="FromChat", lifespan=lifespan)
 
 
 @app.middleware("http")
+async def lift_expired_suspensions_middleware(request: Request, call_next):
+    try:
+        with SessionLocal() as db:
+            lift_expired_suspensions(db)
+            db.commit()
+    except Exception:
+        logger.exception("Failed to lift expired suspensions")
+    return await call_next(request)
+
+
+@app.middleware("http")
 async def server_instance_id_middleware(request: Request, call_next):
     response = await call_next(request)
     response.headers[INSTANCE_ID_HEADER] = get_server_instance_id()
@@ -302,6 +331,9 @@ _cors_origins = [
     "http://127.0.0.1:8300",
     "http://localhost:8301",
     "http://localhost:8300",
+    "http://127.0.0.1:8310",
+    "http://localhost:8310",
+    "https://admin.fromchat.ru",
 ]
 
 _extra_cors = (os.getenv("CORS_EXTRA_ORIGINS") or "").strip()
@@ -339,6 +371,8 @@ app.add_middleware(
 # Routes
 app.include_router(account.router)
 app.include_router(admin_encryption.router)
+app.include_router(admin_panel.router)
+app.include_router(admin_metrics_ws.router)
 app.include_router(auth_steps.router)
 app.include_router(envelope_messaging.router)
 app.include_router(messaging.router)

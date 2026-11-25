@@ -479,37 +479,69 @@ def _stretched_profanity_hit(normalized_cyr: str) -> bool:
     return False
 
 
-def is_allowed(text: str) -> bool:
-    """Return True if text may be published; False if it should be rejected."""
+def explain(text: str) -> dict[str, str | bool]:
+    """Return allow/deny with category labels (no matched literals)."""
     if not text:
-        return True
+        return {"allowed": True, "reason_code": "", "reason_detail": ""}
 
     if has_disallowed_characters(text):
-        return False
+        return {
+            "allowed": False,
+            "reason_code": "charset",
+            "reason_detail": "Text contains disallowed characters",
+        }
 
     if _phrase_hit(text):
-        return False
+        return {
+            "allowed": False,
+            "reason_code": "phrase",
+            "reason_detail": "Blocked phrase pattern",
+        }
 
     if _token_obfuscation_hit(text):
-        return False
+        return {
+            "allowed": False,
+            "reason_code": "obfuscation",
+            "reason_detail": "Obfuscated token pattern",
+        }
 
     cyr = map_to_cyrillic_letters(text)
     if cyr and cyr in _WHITELIST:
-        return True
+        return {"allowed": True, "reason_code": "", "reason_detail": ""}
 
     if cyr and _stretched_profanity_hit(cyr):
-        return False
+        return {
+            "allowed": False,
+            "reason_code": "profanity",
+            "reason_detail": "Stretched profanity pattern",
+        }
 
     if cyr and _ru_terms_hit(text, cyr, _term_match_forms(text, cyr)):
-        return False
+        return {
+            "allowed": False,
+            "reason_code": "profanity",
+            "reason_detail": "Russian content policy match",
+        }
 
     ascii_form = map_to_ascii_letters(text)
     if ascii_form and _ascii_terms_hit(text, ascii_form):
-        return False
+        return {
+            "allowed": False,
+            "reason_code": "profanity",
+            "reason_detail": "English content policy match",
+        }
 
-    # Custom blocklist on ascii glued form too
     block = {w.lower().replace(" ", "") for w in blocklist_store.get_blocklist()}
     if ascii_form and _substring_hit(ascii_form, block):
-        return False
+        return {
+            "allowed": False,
+            "reason_code": "blocklist",
+            "reason_detail": "Custom blocklist match",
+        }
 
-    return True
+    return {"allowed": True, "reason_code": "", "reason_detail": ""}
+
+
+def is_allowed(text: str) -> bool:
+    """Return True if text may be published; False if it should be rejected."""
+    return bool(explain(text).get("allowed"))

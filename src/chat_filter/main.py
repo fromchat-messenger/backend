@@ -10,7 +10,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
 from . import blocklist as blocklist_store
-from .engine import is_allowed
+from .engine import explain, is_allowed
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -33,6 +33,12 @@ class CheckResponse(BaseModel):
     allowed: bool
 
 
+class ExplainResponse(BaseModel):
+    allowed: bool
+    reason_code: str = ""
+    reason_detail: str = ""
+
+
 class BlocklistWordsRequest(BaseModel):
     words: List[str] = Field(default_factory=list)
 
@@ -41,6 +47,16 @@ class BlocklistWordsRequest(BaseModel):
 async def health_check():
     """Health check endpoint for Docker health checks."""
     return {"status": "healthy", "service": "chat_filter"}
+
+
+@app.post("/explain", response_model=ExplainResponse)
+def explain_route(body: CheckRequest) -> ExplainResponse:
+    data = explain(body.text)
+    return ExplainResponse(
+        allowed=bool(data.get("allowed")),
+        reason_code=str(data.get("reason_code") or ""),
+        reason_detail=str(data.get("reason_detail") or ""),
+    )
 
 
 @app.post("/check", response_model=CheckResponse)

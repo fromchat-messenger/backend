@@ -86,6 +86,7 @@ import os
 import base64
 import uuid
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from fastapi import UploadFile, File, HTTPException, Request, Depends
@@ -1135,6 +1136,91 @@ async def get_file_encrypted(filename: str, request: Request):
     except ValueError:
         raise HTTPException(status_code=401, detail="Invalid user authentication")
     return await get_file_encrypted_internal(filename, user_id)
+
+
+_INTERNAL_AUTH_TOKEN = (os.getenv("INTERNAL_AUTH_TOKEN") or "").strip()
+
+
+def _require_internal_auth(request: Request) -> None:
+    if not _INTERNAL_AUTH_TOKEN:
+        return
+    header = (request.headers.get("X-Internal-Auth") or "").strip()
+    if header != _INTERNAL_AUTH_TOKEN:
+        raise HTTPException(status_code=401, detail="Internal auth required")
+
+
+def _iter_storage_files(prefix: str) -> list[dict]:
+    roots = [
+        ("normal", FILES_NORMAL_DIR),
+        ("encrypted", FILES_ENCRYPTED_DIR),
+        ("thumbs", THUMBS_DIR),
+        ("files", FILES_DIR),
+    ]
+    items: list[dict] = []
+    prefix_norm = prefix.strip().lstrip("/")
+    for kind, root in roots:
+        if not root.exists():
+            continue
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(root).as_posix()
+            stored = f"{kind}/{rel}" if kind != "files" else rel
+            if prefix_norm and not stored.startswith(prefix_norm):
+                continue
+            stat = path.stat()
+            items.append(
+                {
+                    "stored_name": stored,
+                    "kind": kind,
+                    "size_bytes": stat.st_size,
+                    "modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                }
+            )
+    items.sort(key=lambda row: row["stored_name"])
+    return items
+
+
+@app.get("/internal/files/list", response_model=None)
+async def internal_list_files(
+    request: Request,
+    prefix: str = "",
+    limit: int = 100,
+    cursor: str | None = None,
+):
+    _require_internal_auth(request)
+    limit = max(1, min(limit, 500))
+    items = _iter_storage_files(prefix)
+    start = 0
+    if cursor:
+        for index, row in enumerate(items):
+            if row["stored_name"] == cursor:
+                start = index + 1
+                break
+    page = items[start : start + limit]
+    next_cursor = page[-1]["stored_name"] if len(page) == limit else None
+    return {"files": page, "next_cursor": next_cursor, "total": len(items)}
+
+
+@app.delete("/internal/files/{stored_name:path}", response_model=None)
+async def internal_delete_file(stored_name: str, request: Request):
+    _require_internal_auth(request)
+    name = stored_name.strip().lstrip("/")
+    if not name or ".." in name.split("/"):
+        raise HTTPException(status_code=400, detail="Invalid path")
+    target: Path | None = None
+    if name.startswith("normal/"):
+        target = FILES_NORMAL_DIR / name.removeprefix("normal/")
+    elif name.startswith("encrypted/"):
+        target = FILES_ENCRYPTED_DIR / name.removeprefix("encrypted/")
+    elif name.startswith("thumbs/"):
+        target = THUMBS_DIR / name.removeprefix("thumbs/")
+    else:
+        target = FILES_DIR / name
+    if target is None or not target.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    target.unlink(missing_ok=True)
+    return {"status": "deleted", "stored_name": name}
 
 
 if __name__ == "__main__":

@@ -33,7 +33,7 @@ from ..constants import (
 from ..dependencies import get_db
 from ..models import DeviceSession, User
 from ..security.audit import log_security
-from ..security.chat_filter import contains_profanity
+from ..security.content_policy import assert_content_allowed
 from ..security.rate_limit import rate_limit_per_ip
 from ..utils import create_token, get_client_ip, get_password_hash, verify_password
 from ..username import username_taken
@@ -220,11 +220,13 @@ def auth_step_username(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Имя пользователя должно быть от 3 до 20 символов и содержать только английские буквы, цифры, дефисы и подчеркивания",
         )
-    if contains_profanity(username):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Имя пользователя содержит запрещённые слова",
-        )
+    assert_content_allowed(
+        db,
+        text=username,
+        source="auth.username_check",
+        request=request,
+        detail="Имя пользователя содержит запрещённые слова",
+    )
     exists = username_taken(db, username)
     return {"ok": True, "exists": exists}
 
@@ -240,11 +242,13 @@ def auth_step_password(
     password = body.password.strip()
     client_ip = get_client_ip(request)
 
-    if contains_profanity(username):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Имя пользователя содержит запрещённые слова",
-        )
+    assert_content_allowed(
+        db,
+        text=username,
+        source="auth.password",
+        request=request,
+        detail="Имя пользователя содержит запрещённые слова",
+    )
     if not is_valid_username(username):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -322,21 +326,25 @@ def auth_step_register_confirm(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Имя пользователя должно быть от 3 до 20 символов и содержать только английские буквы, цифры, дефисы и подчеркивания",
         )
-    if contains_profanity(username):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Имя пользователя содержит запрещённые слова",
-        )
+    assert_content_allowed(
+        db,
+        text=username,
+        source="auth.register",
+        request=request,
+        detail="Имя пользователя содержит запрещённые слова",
+    )
     if not is_valid_display_name(display_name):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Отображаемое имя должно быть от 1 до 64 символов и не может быть пустым",
         )
-    if contains_profanity(display_name):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Отображаемое имя содержит запрещённые слова",
-        )
+    assert_content_allowed(
+        db,
+        text=display_name,
+        source="auth.register",
+        request=request,
+        detail="Отображаемое имя содержит запрещённые слова",
+    )
     if not is_valid_password(password):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -360,9 +368,12 @@ def auth_step_register_confirm(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Описание должно быть не длиннее 500 символов",
         )
-    if bio_text and contains_profanity(bio_text):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+    if bio_text:
+        assert_content_allowed(
+            db,
+            text=bio_text,
+            source="auth.register",
+            request=request,
             detail="Описание содержит запрещённые слова",
         )
 

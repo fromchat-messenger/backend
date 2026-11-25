@@ -8,7 +8,13 @@ Uses CHAT_FILTER_URL from constants. ENABLE_CHAT_FILTER:
 
 from __future__ import annotations
 
-from typing import Iterable, List, Tuple
+from typing import Iterable, List, Tuple, TypedDict
+
+
+class FilterVerdict(TypedDict):
+    blocked: bool
+    reason_code: str
+    reason_detail: str
 
 import httpx
 from fastapi import HTTPException
@@ -30,6 +36,41 @@ def _require_filter_enabled() -> None:
         )
 
 
+def evaluate_content(text: str) -> FilterVerdict:
+    """Return whether content is blocked and why (category only)."""
+    if not text or CHAT_FILTER_DISABLED:
+        return {"blocked": False, "reason_code": "", "reason_detail": ""}
+
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as client:
+            response = client.post(f"{_base()}/explain", json={"text": text})
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Content filter unavailable",
+        ) from exc
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=503,
+            detail="Content filter unavailable",
+        )
+
+    try:
+        data = response.json()
+        allowed = bool(data.get("allowed", False))
+        return {
+            "blocked": not allowed,
+            "reason_code": str(data.get("reason_code") or ""),
+            "reason_detail": str(data.get("reason_detail") or ""),
+        }
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Content filter unavailable",
+        ) from exc
+
+
 def contains_profanity(text: str) -> bool:
     """
     Return True if content must be rejected.
@@ -40,37 +81,7 @@ def contains_profanity(text: str) -> bool:
         return False
     if CHAT_FILTER_DISABLED:
         return False
-
-    try:
-        with httpx.Client(timeout=_TIMEOUT) as client:
-            response = client.post(f"{_base()}/check", json={"text": text})
-    except httpx.HTTPError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail="Content filter unavailable",
-        ) from exc
-
-    if response.status_code >= 500:
-        raise HTTPException(
-            status_code=503,
-            detail="Content filter unavailable",
-        )
-    if response.status_code >= 400:
-        raise HTTPException(
-            status_code=503,
-            detail="Content filter unavailable",
-        )
-
-    try:
-        data = response.json()
-        allowed = bool(data.get("allowed", False))
-    except Exception as exc:
-        raise HTTPException(
-            status_code=503,
-            detail="Content filter unavailable",
-        ) from exc
-
-    return not allowed
+    return evaluate_content(text)["blocked"]
 
 
 def add_to_blocklist(words: Iterable[str]) -> Tuple[List[str], List[str]]:

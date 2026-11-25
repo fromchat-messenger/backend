@@ -1,4 +1,5 @@
 from pathlib import Path
+from datetime import datetime
 import logging
 import re
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
@@ -26,7 +27,8 @@ from ..verification_service import (
 )
 from .messaging import messagingManager
 from ..security.audit import log_security
-from ..security.chat_filter import contains_profanity
+from ..security.content_policy import assert_content_allowed
+from ..security.content_policy import assert_content_allowed
 from ..security.rate_limit import rate_limit_per_ip
 from ..deleted_user import DELETED_LAST_SEEN, deleted_user_api_fields, is_deleted_or_suspended, is_deleted_user
 
@@ -286,6 +288,7 @@ async def list_users(
                 verification_status=verification_status.value,
                 suspended=user.suspended or False,
                 suspension_reason=user.suspension_reason,
+                suspended_until=user.suspended_until,
                 deleted=user.deleted or False,
             ).model_dump()
         )
@@ -312,11 +315,14 @@ async def update_user_profile(
                 status_code=400, 
                 detail="Имя пользователя должно быть от 3 до 20 символов и содержать только английские буквы, цифры, дефисы и подчеркивания"
             )
-        if contains_profanity(username):
-            raise HTTPException(
-                status_code=400,
-                detail="Имя пользователя содержит запрещённые слова"
-            )
+        assert_content_allowed(
+            db,
+            text=username,
+            source="profile.username",
+            request=request,
+            user=current_user,
+            detail="Имя пользователя содержит запрещённые слова",
+        )
         
         # Case-insensitive uniqueness; store typed casing as entered.
         if username_taken(db, username, exclude_user_id=current_user.id):
@@ -333,11 +339,14 @@ async def update_user_profile(
                 status_code=400, 
                 detail="Отображаемое имя должно быть от 1 до 64 символов и не может быть пустым"
             )
-        if contains_profanity(display_name):
-            raise HTTPException(
-                status_code=400,
-                detail="Отображаемое имя содержит запрещённые слова"
-            )
+        assert_content_allowed(
+            db,
+            text=display_name,
+            source="profile.display_name",
+            request=request,
+            user=current_user,
+            detail="Отображаемое имя содержит запрещённые слова",
+        )
         
         current_user.display_name = display_name
         updated = True
@@ -347,9 +356,13 @@ async def update_user_profile(
         bio = update_request.description.strip()
         if len(bio) > 500:
             raise HTTPException(status_code=400, detail="Bio must be 500 characters or less")
-        if bio and contains_profanity(bio):
-            raise HTTPException(
-                status_code=400,
+        if bio:
+            assert_content_allowed(
+                db,
+                text=bio,
+                source="profile.bio",
+                request=request,
+                user=current_user,
                 detail="Описание содержит запрещённые слова",
             )
         
@@ -394,9 +407,13 @@ async def update_user_bio(
         raise HTTPException(status_code=400, detail="Bio must be 500 characters or less")
 
     bio = bio_request.bio.strip()
-    if bio and contains_profanity(bio):
-        raise HTTPException(
-            status_code=400,
+    if bio:
+        assert_content_allowed(
+            db,
+            text=bio,
+            source="profile.bio",
+            request=request,
+            user=current_user,
             detail="Описание содержит запрещённые слова",
         )
 
@@ -535,6 +552,7 @@ async def verify_user(
 # Admin endpoints for user management
 class SuspendUserRequest(BaseModel):
     reason: str
+    until: datetime | None = None
 
 @router.post("/user/{user_id}/suspend")
 async def suspend_user(
@@ -558,9 +576,9 @@ async def suspend_user(
     if target_user.id == 1:
         raise HTTPException(status_code=400, detail="Cannot suspend admin account")
     
-    # Suspend the user
     target_user.suspended = True
     target_user.suspension_reason = request.reason
+    target_user.suspended_until = request.until
     from .account import revoke_all_user_sessions
     revoke_all_user_sessions(db, target_user.id)
     db.commit()
@@ -607,9 +625,9 @@ async def unsuspend_user(
     if not target_user:
         raise HTTPException(status_code=404, detail="User not found")
     
-    # Unsuspend the user
     target_user.suspended = False
     target_user.suspension_reason = None
+    target_user.suspended_until = None
     db.commit()
 
     # Send WebSocket unsuspension message

@@ -33,6 +33,7 @@ import json
 from pydantic import BaseModel
 from ..security.audit import log_access, log_dm, log_public_chat, log_security
 from ..security.chat_filter import contains_profanity
+from ..security.content_policy import assert_content_allowed
 from ..security.rate_limit import rate_limit_per_ip
 from ..verification_service import (
     VerificationStatus,
@@ -918,11 +919,14 @@ async def _send_message_internal(
             detail="No content provided"
         )
 
-    # Check for profanity and reject the message instead of censoring
-    if raw_content and contains_profanity(raw_content):
-        raise HTTPException(
-            status_code=422,  # Unprocessable Entity - content validation failed
-            detail="Message contains inappropriate content and cannot be sent"
+    if raw_content:
+        assert_content_allowed(
+            db,
+            text=raw_content,
+            source="public_chat",
+            user=current_user,
+            message_id=None,
+            detail="Message contains inappropriate content and cannot be sent",
         )
 
     # Escape content for safe HTML display
@@ -1929,12 +1933,14 @@ async def _edit_message_internal(
 
     original_content = message.content
 
-    # Check for profanity and reject the edit instead of censoring
-    if contains_profanity(raw_content):
-        raise HTTPException(
-            status_code=422,  # Unprocessable Entity - content validation failed
-            detail="Message contains inappropriate content and cannot be sent"
-        )
+    assert_content_allowed(
+        db,
+        text=raw_content,
+        source="public_chat",
+        user=current_user,
+        message_id=message_id,
+        detail="Message contains inappropriate content and cannot be sent",
+    )
 
     escaped_content = html.escape(raw_content, quote=False)
 

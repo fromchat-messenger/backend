@@ -27,8 +27,8 @@ router = APIRouter(prefix="/moderation", tags=["moderation"])
 
 
 def _ensure_owner(user: User) -> None:
-    if user.username != OWNER_USERNAME:
-        raise HTTPException(status_code=403, detail="Only owner can perform this action")
+    if user.id != 1:
+        raise HTTPException(status_code=403, detail="Only admin can perform this action")
 
 
 @router.get("/blocklist")
