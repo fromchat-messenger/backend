@@ -18,7 +18,7 @@ from ..models import DMEnvelope, Message, MessageFile, User
 router = APIRouter(tags=["admin-metrics"])
 
 _HISTORY_BUCKETS = 60
-_TICK_SECONDS = 2.0
+_TICK_SECONDS = 1.0
 
 
 def _cpu_snapshot() -> dict[str, float]:
