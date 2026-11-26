@@ -26,6 +26,7 @@ from ..models import (
 from ..security.chat_filter import evaluate_content
 from ..presence_service import presence_service
 from ..routes.profile import (
+    _build_user_profile_response,
     _ensure_owner_unsuspended,
     compute_verification_status,
     get_verified_users_data,
@@ -50,6 +51,11 @@ class AdminUsersResponse(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class AdminUserPatch(BaseModel):
+    display_name: str | None = None
+    bio: str | None = None
 
 
 @router.get("/users", response_model=AdminUsersResponse)
@@ -107,11 +113,39 @@ async def admin_list_users(
     return AdminUsersResponse(users=items, total=total, limit=limit, offset=offset)
 
 
+@router.put("/users/{user_id}")
+async def admin_update_user(
+    user_id: int,
+    body: AdminUserPatch,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _require_system_admin(current_user)
+    if user_id <= 0:
+        raise HTTPException(status_code=400, detail="Invalid user ID")
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if body.display_name is not None:
+        user.display_name = body.display_name.strip()
+    if body.bio is not None:
+        user.bio = body.bio.strip()
+    db.commit()
+    db.refresh(user)
+    verified_users_data = get_verified_users_data(db)
+    return _build_user_profile_response(
+        user,
+        is_owner_request=True,
+        verified_users_data=verified_users_data,
+    )
+
+
 @router.get("/moderation/events")
 async def list_moderation_events(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     source: str | None = None,
+    user_id: int | None = Query(None, ge=1),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -119,6 +153,8 @@ async def list_moderation_events(
     query = db.query(ModerationEvent).order_by(ModerationEvent.created_at.desc())
     if source:
         query = query.filter(ModerationEvent.source == source)
+    if user_id is not None:
+        query = query.filter(ModerationEvent.user_id == user_id)
     total = query.count()
     rows = query.offset(offset).limit(limit).all()
     return {
